@@ -96,6 +96,7 @@ TaskHandle_t idle_0_handle;
 TaskHandle_t idle_1_handle;
 TaskHandle_t sequencer_handle;
 TaskHandle_t cv_read_handle;
+TaskHandle_t cynthia_input_handle;
 
 // For CPU usage
 unsigned long last_task_counters[MAX_TASKS];
@@ -198,18 +199,33 @@ uint8_t lvgl_setup = 0;
 
 void mp_task(void *pvParameter) {
     volatile uint32_t sp = (uint32_t)esp_cpu_get_sp();
+    fprintf(stderr, "mp_task: start\n"); fflush(stderr);
+    
+    // Set mp_main_task_handle for USB Serial/JTAG ISR wake-up
+    // Must be set from within the task itself
+    extern TaskHandle_t mp_main_task_handle;
+    mp_main_task_handle = xTaskGetCurrentTaskHandle();
+    fprintf(stderr, "mp_task: mp_main_task_handle set\n"); fflush(stderr);
+    
     #if MICROPY_PY_THREAD
     mp_thread_init(pxTaskGetStackStart(NULL), MICROPY_TASK_STACK_SIZE / sizeof(uintptr_t));
+    fprintf(stderr, "mp_task: thread init done\n"); fflush(stderr);
     #endif
     #if MICROPY_HW_ESP_USB_SERIAL_JTAG
+    fprintf(stderr, "mp_task: init usb_serial_jtag\n"); fflush(stderr);
     usb_serial_jtag_init();
+    fprintf(stderr, "mp_task: usb_serial_jtag done\n"); fflush(stderr);
     #elif MICROPY_HW_ENABLE_USBDEV
+    fprintf(stderr, "mp_task: init usb (TinyUSB CDC)\n"); fflush(stderr);
     usb_init();
+    fprintf(stderr, "mp_task: usb init done\n"); fflush(stderr);
     #endif
     #if MICROPY_HW_ENABLE_UART_REPL
     uart_stdout_init();
     #endif
+    fprintf(stderr, "mp_task: machine_init\n"); fflush(stderr);
     machine_init();
+    fprintf(stderr, "mp_task: machine_init done\n"); fflush(stderr);
 
     
     esp_err_t err = esp_event_loop_create_default();
@@ -220,7 +236,9 @@ void mp_task(void *pvParameter) {
     heap_caps_register_failed_alloc_callback(esp_alloc_failed);
     uint32_t caps = MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM;
     size_t mp_task_heap_size = MP_TASK_HEAP_SIZE; 
+    fprintf(stderr, "mp_task: allocating %d bytes heap from PSRAM\n", mp_task_heap_size); fflush(stderr);
     void *mp_task_heap = heap_caps_malloc(mp_task_heap_size, caps);
+    fprintf(stderr, "mp_task: heap allocated at %p\n", mp_task_heap); fflush(stderr);
 
 soft_reset:
 
@@ -323,9 +341,11 @@ void boardctrl_startup(void) {
 }
 
 
+#ifdef AMYBOARD
 extern esp_err_t i2c_follower_init();
 extern void i2c_check_for_data();
 extern TaskHandle_t i2c_check_for_data_handle;
+#endif
 
 uint8_t * xStack;
 StaticTask_t static_mp_handle;
@@ -333,29 +353,56 @@ StaticTask_t static_mp_handle;
 
 
 void app_main(void) {
+    fprintf(stderr, "app_main: start\n"); fflush(stderr);
     // Hook for a board to run code at start up.
     // This defaults to initialising NVS.
+    fprintf(stderr, "app_main: calling MICROPY_BOARD_STARTUP\n"); fflush(stderr);
     MICROPY_BOARD_STARTUP();
+    fprintf(stderr, "app_main: MICROPY_BOARD_STARTUP done\n"); fflush(stderr);
     for(uint8_t i=0;i<MAX_TASKS;i++) last_task_counters[i] = 0;
+    fprintf(stderr, "app_main: counters initialized\n"); fflush(stderr);
 
     // Grab the idle tasks
+    fprintf(stderr, "app_main: getting idle tasks\n"); fflush(stderr);
     idle_0_handle = xTaskGetIdleTaskHandleForCPU(0);
     idle_1_handle = xTaskGetIdleTaskHandleForCPU(1);
+    fprintf(stderr, "app_main: idle tasks done\n"); fflush(stderr);
 
+#ifdef AMYBOARD
+    // I2C follower mode and CV ADC reader are AMYboard-specific
+    fprintf(stderr, "app_main: i2c_follower_init\n"); fflush(stderr);
     i2c_follower_init();
+    fprintf(stderr, "app_main: creating i2c_check_for_data task\n"); fflush(stderr);
     xTaskCreatePinnedToCore(i2c_check_for_data, "i2c_check_for_data", 8192, NULL, 20, &i2c_check_for_data_handle, 0);
     fflush(stderr);
     delay_ms(500);
 
     // Start the CV ADC reader task (reads ADS1015 over I2C, updates cached values)
+    fprintf(stderr, "app_main: creating cv_read_task\n"); fflush(stderr);
     extern void cv_read_task(void *pvParameter);
     xTaskCreatePinnedToCore(cv_read_task, CV_READ_TASK_NAME, CV_READ_TASK_STACK_SIZE / sizeof(StackType_t), NULL, CV_READ_TASK_PRIORITY, &cv_read_handle, CV_READ_TASK_COREID);
+    fprintf(stderr, "app_main: cv_read_task created\n"); fflush(stderr);
+#elif defined(CYNTHIA)
+    // Start CYNTHIA dedicated C input task (MCP23017 keys/buttons, ADS1115 pots/joystick)
+    fprintf(stderr, "app_main: creating cynthia_input_task\n"); fflush(stderr);
+    extern void cynthia_input_task(void *pvParameter);
+    xTaskCreatePinnedToCore(cynthia_input_task, CYNTHIA_INPUT_TASK_NAME, CYNTHIA_INPUT_TASK_STACK_SIZE / sizeof(StackType_t), NULL, CYNTHIA_INPUT_TASK_PRIORITY, &cynthia_input_handle, CYNTHIA_INPUT_TASK_COREID);
+    fprintf(stderr, "app_main: cynthia_input_task created\n"); fflush(stderr);
+#endif
 
     fprintf(stderr,"Starting MicroPython on core %d\n", TULIP_MP_TASK_COREID);
+    fprintf(stderr, "app_main: creating mp_task\n"); fflush(stderr);
     xTaskCreatePinnedToCore(mp_task, TULIP_MP_TASK_NAME, (TULIP_MP_TASK_STACK_SIZE) / sizeof(StackType_t), NULL, TULIP_MP_TASK_PRIORITY, &tulip_mp_handle, TULIP_MP_TASK_COREID);
+    fprintf(stderr, "app_main: mp_task created\n"); fflush(stderr);
     fflush(stderr);
     delay_ms(100);
+#ifndef CYNTHIA
+    // tsequencer_init() depends on amy_global which is initialized by Python
+    // For CYNTHIA, skip this for now (headless mode)
+    fprintf(stderr, "app_main: tsequencer_init\n"); fflush(stderr);
     tsequencer_init();
+#endif
+    fprintf(stderr, "app_main: done\n"); fflush(stderr);
 }
 
 void nlr_jump_fail(void *val) {

@@ -265,14 +265,12 @@ extern bool midi_has_out;
 extern void send_usb_midi_out(uint8_t * data, uint16_t len);
 
 void tulip_send_midi_out(uint8_t* buf, uint16_t len) {
-    // check if we have USB HOST midi, which is handled by Tulip only - not AMYBOARD or TDECK
+    // check if we have USB HOST midi, which is handled by Tulip only - not AMYBOARD, TDECK, or CYNTHIA
 #ifdef ESP_PLATFORM
-#ifndef TDECK
-#ifndef AMYBOARD
+#if !defined(TDECK) && !defined(AMYBOARD) && !defined(CYNTHIA)
     if(midi_has_out) {
         send_usb_midi_out(buf, len);
     }
-#endif
 #endif
 #endif
 #ifndef AMY_IS_EXTERNAL
@@ -283,7 +281,7 @@ void tulip_send_midi_out(uint8_t* buf, uint16_t len) {
 
 #ifndef AMY_IS_EXTERNAL
 
-#if (defined AMYBOARD) || (defined TULIP) || (defined AMYBOARD_VCV)
+#if (defined AMYBOARD) || (defined TULIP) || (defined AMYBOARD_VCV) || (defined CYNTHIA)
 #include "tulip_helpers.h"
 // map the mp_obj_t to a file handle
 
@@ -397,7 +395,7 @@ STATIC mp_obj_t tulip_environment_transfer_done(size_t n_args, const mp_obj_t *a
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_environment_transfer_done_obj, 0, 1, tulip_environment_transfer_done);
 
 void mp_exec_hook(const char *code) {
-#if defined(AMYBOARD) || defined(AMYBOARD_VCV)
+#if defined(AMYBOARD) || defined(AMYBOARD_VCV) || defined(CYNTHIA)
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t code_str = mp_obj_new_str(code, strlen(code));
@@ -413,7 +411,7 @@ void mp_exec_hook(const char *code) {
 }
 
 void mp_file_transfer_done_hook(const char *filename) {
-#if defined(AMYBOARD) || defined(AMYBOARD_VCV)
+#if defined(AMYBOARD) || defined(AMYBOARD_VCV) || defined(CYNTHIA)
     if (filename == NULL || filename[0] == '\0') {
         return;
     }
@@ -437,7 +435,7 @@ RTC_NOINIT_ATTR uint32_t amyboard_bootloader_flag;
 #endif
 
 void mp_reboot_hook(uint8_t mode) {
-#if defined(AMYBOARD) && defined(ESP_PLATFORM)
+#if (defined(AMYBOARD) || defined(CYNTHIA)) && defined(ESP_PLATFORM)
     if (mode == 0) {
         // Bootloader mode: skip sketch on next boot.
         amyboard_bootloader_flag = AMYBOARD_BOOTLOADER_MAGIC;
@@ -475,10 +473,12 @@ static void mount_gamma9001_drums(void) {
 
 #endif  // hooks: AMYBOARD || TULIP || AMYBOARD_VCV
 
-#if (defined AMYBOARD) || (defined TULIP)
+#if (defined AMYBOARD) || (defined TULIP) || (defined CYNTHIA)
 
 void run_amy(uint8_t midi_out_pin) {
+    fprintf(stderr, "run_amy: start, midi_out_pin=%d\n", midi_out_pin);
     amy_config_t amy_config = amy_default_config();
+    fprintf(stderr, "run_amy: amy_default_config done\n");
     amy_config.amy_external_midi_input_hook = tulip_midi_input_hook;
 #ifdef TULIP_USER_C_DSP
     amy_config.amy_external_render_hook = tulip_render_hook_chain;
@@ -505,19 +505,25 @@ void run_amy(uint8_t midi_out_pin) {
     extern float cv_input_hook(uint16_t channel);
     amy_config.amy_external_coef_hook = cv_input_hook;
 #endif
-#ifdef AMYBOARD
+#if defined(CYNTHIA)
+    amy_config.features.audio_in = 0;  // CYNTHIA has no audio input hardware
+    amy_config.midi = AMY_MIDI_IS_UART | AMY_MIDI_IS_USB_GADGET;
+#elif defined(AMYBOARD)
     amy_config.features.audio_in = 1;
     amy_config.midi = AMY_MIDI_IS_UART | AMY_MIDI_IS_USB_GADGET;
 #else
     amy_config.features.audio_in = 0;
     amy_config.midi = AMY_MIDI_IS_UART;
 #endif
+    fprintf(stderr, "run_amy: audio=I2S, audio_in=%d, midi=%d\n", amy_config.features.audio_in, amy_config.midi);
     amy_config.features.default_synths = 0; // midi.py does this for us
     amy_config.i2s_lrc = CONFIG_I2S_LRCLK;
     amy_config.i2s_bclk = CONFIG_I2S_BCLK;
     amy_config.i2s_dout = CONFIG_I2S_DOUT;
     amy_config.i2s_din = CONFIG_I2S_DIN;
     amy_config.i2s_mclk = CONFIG_I2S_MCLK;
+    fprintf(stderr, "run_amy: I2S pins: bclk=%d, dout=%d, lrc=%d, din=%d, mclk=%d\n",
+            amy_config.i2s_bclk, amy_config.i2s_dout, amy_config.i2s_lrc, amy_config.i2s_din, amy_config.i2s_mclk);
     amy_config.midi_out = midi_out_pin;
     amy_config.midi_in = MIDI_IN_PIN;
 #ifndef AMYBOARD
@@ -526,7 +532,9 @@ void run_amy(uint8_t midi_out_pin) {
 #if defined(GAMMA9001) && defined(ESP_PLATFORM)
     mount_gamma9001_drums();
 #endif
+    fprintf(stderr, "run_amy: calling amy_start...\n");
     amy_start(amy_config);
+    fprintf(stderr, "run_amy: amy_start done\n");
     external_map = malloc_caps(amy_config.max_oscs, MALLOC_CAP_INTERNAL);
     for(uint16_t i=0;i<amy_config.max_oscs;i++) external_map[i] = 0;
     for(uint8_t i=0;i<MAX_CV_SYNTHS;i++) cv_synth_map[i] = 0;

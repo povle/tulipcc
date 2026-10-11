@@ -21,6 +21,7 @@ require("umqtt.simple")
 
 freeze("$(PORT_DIR)/../shared/py")
 freeze("$(PORT_DIR)/../shared/amyboard-py")
+package("cynthia", base_path="$(PORT_DIR)/../shared/cynthia-py")
 package("amy", base_path="$(MPY_DIR)/../amy")
 
 #freeze("$(MPY_DIR)/lib/micropython-lib/micropython/utarfile", "utarfile.py")

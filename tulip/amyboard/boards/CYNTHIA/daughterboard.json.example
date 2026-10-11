@@ -1,0 +1,10 @@
+{
+  "adc_chip": "ads1115",
+  "slots": {
+    "slot0": { "driver": "spark_main" },
+    "slot1": {
+      "driver": "spark_pots_new",
+      "leds": { "pin": "E", "count": 16 }
+    }
+  }
+}

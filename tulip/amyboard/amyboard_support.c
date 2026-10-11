@@ -25,7 +25,9 @@
 #include "pins.h"
 
 
+#ifdef AMYBOARD
 TaskHandle_t i2c_check_for_data_handle;
+#endif
 
 
 #define AMY_I2C_CHECK_FOR_DATA_TASK_COREID (1)
@@ -48,6 +50,7 @@ TaskHandle_t i2c_check_for_data_handle;
 #define ADS1015_ADDR 0x48
 #define GP8413_ADDR  0x58
 
+#ifdef AMYBOARD
 esp_err_t i2c_follower_init() {
     i2c_port_t i2c_follower_port = I2C_FOLLOWER_NUM;
     i2c_config_t conf_follower;
@@ -78,6 +81,7 @@ void i2c_check_for_data() {
         }
     }
 }
+#endif // AMYBOARD
 
 
 
@@ -271,6 +275,7 @@ float cv_input_hook(uint16_t channel) {
 }
 
 #ifdef ESP_PLATFORM
+#ifdef AMYBOARD
 // FreeRTOS task: reads both ADS1015 channels in a loop, updates cv_cached_value.
 void cv_read_task(void *pvParameter) {
     // Bench-calibrated (loopback vs multimeter, 2026-08-07): raw = 20080 + 2003*V.
@@ -302,5 +307,6 @@ void cv_read_task(void *pvParameter) {
         xTaskDelayUntil(&last_wake, cv_period);
     }
 }
-#endif
+#endif // AMYBOARD
+#endif // ESP_PLATFORM
 

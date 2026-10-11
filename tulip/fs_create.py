@@ -5,7 +5,7 @@ import os
 import sys
 
 if(len(sys.argv)<2):
-    print("Usage: python fs_create.py (amyboard,tulip) [flash]")
+    print("Usage: python fs_create.py (amyboard,tulip) [flash|flash-notouch]")
 
 distro = sys.argv[1]
 
@@ -133,10 +133,74 @@ os.system("cp build/micropython.bin dist/%s-firmware-%s.bin" % (distro, MICROPY_
 os.system("cp build/%s-sys.bin dist/%s-sys.bin" %(distro, distro))
 
 # Optionally do the flash of the whole image
+#   flash          - normal: CYNTHIA does the 1200bps touch to enter the
+#                    bootloader automatically; other boards use default_reset.
+#   flash-notouch  - skip the touch entirely and flash with --before no_reset.
+#                    Use this when the board is ALREADY in the ROM bootloader
+#                    (e.g. you held the BOOT button while plugging in / resetting,
+#                    or a previous touch left it there). Works on any board.
 if(len(sys.argv)>2):
-    if(sys.argv[2]== 'flash'):
-        print("Writing full image")
-        os.system("esptool.py write_flash 0x0 dist/%s-full-%s.bin" % (distro, MICROPY_BOARD))
+    if(sys.argv[2] in ('flash', 'flash-notouch')):
+        no_touch = (sys.argv[2] == 'flash-notouch')
+        print("Writing full image%s" % (" (no-touch mode)" if no_touch else ""))
+        # CYNTHIA is a native-USB-CDC board (TinyUSB, no UART auto-reset circuit).
+        # esptool's default_reset/usb_reset strategies toggle DTR/RTS, which only
+        # works with the ESP32-S3's built-in USB-JTAG-Serial ROM peripheral -- not
+        # with TinyUSB CDC. CYNTHIA's firmware instead implements the Arduino-style
+        # 1200bps touch (MICROPY_HW_USB_CDC_1200BPS_TOUCH): opening the CDC port at
+        # 1200 baud and closing it makes the firmware jump to the ROM bootloader.
+        # Do that touch here, wait for the ROM bootloader to re-enumerate, then
+        # flash with --before no_reset (the chip is already in the bootloader).
+        if(MICROPY_BOARD == 'CYNTHIA' and not no_touch):
+            import serial
+            import serial.tools.list_ports
+            import time as _time
+
+            def _find_cynthia_port():
+                # The CDC REPL port is the one whose interface name contains CDC.
+                # MicroPython's TinyUSB descriptor exposes CDC + MIDI; the CDC
+                # interface is what we want. Fall back to any usbmodem port.
+                candidates = []
+                for p in serial.tools.list_ports.comports():
+                    if p.device.startswith('/dev/cu.'):
+                        candidates.append(p)
+                # Prefer a port whose description/interface hints at CDC/MicroPython.
+                for p in candidates:
+                    desc = (p.description or '') + ' ' + (p.interface or '')
+                    if 'CDC' in desc.upper() or 'MICROPYTHON' in desc.upper() or 'SERIAL' in desc.upper():
+                        return p.device
+                # Otherwise pick the first usbmodem (CDC) port.
+                for p in candidates:
+                    if 'usbmodem' in p.device:
+                        return p.device
+                return None
+
+            port = os.environ.get('ESPPORT') or _find_cynthia_port()
+            if port is None:
+                print("CYNTHIA: no CDC serial port found; plug the board in and retry.")
+                sys.exit(1)
+            print("CYNTHIA: touching %s at 1200 baud to enter bootloader..." % port)
+            try:
+                ser = serial.Serial(port, baudrate=1200, timeout=1)
+                ser.setDTR(False)
+                ser.setRTS(False)
+                ser.close()
+            except Exception as e:
+                print("CYNTHIA: 1200bps touch failed: %s" % e)
+                sys.exit(1)
+            # The chip resets and re-enumerates as the ROM bootloader. Give it time.
+            _time.sleep(2.0)
+            # Flash with no_reset: the chip is already in the ROM bootloader.
+            os.system("esptool.py --before no_reset write_flash 0x0 dist/%s-full-%s.bin" % (distro, MICROPY_BOARD))
+        elif(no_touch):
+            # flash-notouch: assume the chip is already in the ROM bootloader
+            # (BOOT held at reset, or a previous touch). No port probing, no
+            # reset strategy -- just talk to whatever is there. Set ESPPORT to
+            # pin the port if more than one serial device is attached.
+            port_arg = ("-p %s " % os.environ['ESPPORT']) if os.environ.get('ESPPORT') else ""
+            os.system("esptool.py %s--before no_reset write_flash 0x0 dist/%s-full-%s.bin" % (port_arg, distro, MICROPY_BOARD))
+        else:
+            os.system("esptool.py write_flash 0x0 dist/%s-full-%s.bin" % (distro, MICROPY_BOARD))
 
 os.chdir('..')
 

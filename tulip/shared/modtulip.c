@@ -17,7 +17,7 @@
 #endif
 #include "amy_connector.h"
 #include "tsequencer.h"
-#if !defined(AMYBOARD) && !defined(AMYBOARD_WEB) && !defined(AMYBOARD_VCV)
+#if !defined(AMYBOARD) && !defined(AMYBOARD_WEB) && !defined(AMYBOARD_VCV) && !defined(CYNTHIA)
 #include "ui.h"
 #include "keyscan.h"
 #include "display.h"
@@ -79,6 +79,8 @@ STATIC mp_obj_t tulip_board(size_t n_args, const mp_obj_t *args) {
     return mp_obj_new_str("AMYBOARD_WEB", strlen("AMYBOARD_WEB"));    
 #elif defined AMYBOARD_VCV
     return mp_obj_new_str("AMYBOARD_VCV", strlen("AMYBOARD_VCV"));    
+#elif defined CYNTHIA
+    return mp_obj_new_str("CYNTHIA", strlen("CYNTHIA"));
 #elif defined AMYBOARD
     return mp_obj_new_str("AMYBOARD", strlen("AMYBOARD"));    
 #else    
@@ -304,9 +306,11 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_midi_out_obj, 1, 1, tulip_midi_
 
 // Send a message on the "local bus", as if it was received from physical midi in
 STATIC mp_obj_t tulip_midi_local(size_t n_args, const mp_obj_t *args) {
-    if(mp_obj_get_type(args[0]) == &mp_type_bytes) {
-        mp_buffer_info_t bufinfo;
-        mp_get_buffer(args[0], &bufinfo, MP_BUFFER_READ);
+    // Accept anything supporting the read buffer protocol (bytes, bytearray,
+    // memoryview) so callers can reuse a pre-allocated buffer with no per-note
+    // allocation. Fall back to treating the arg as an array of ints.
+    mp_buffer_info_t bufinfo;
+    if(mp_get_buffer(args[0], &bufinfo, MP_BUFFER_READ)) {
         midi_local((uint8_t*)bufinfo.buf, bufinfo.len);
     } else {
         mp_obj_t *items;
@@ -683,7 +687,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_vcv_cv_out_obj, 2, 2, tulip_vcv
 #endif
 
 // Just AMYBOARD c code
-#ifdef AMYBOARD
+#if defined(AMYBOARD) || defined(CYNTHIA)
 
 extern void run_amy(uint8_t);
 
@@ -750,6 +754,136 @@ STATIC mp_obj_t tulip_i2c_bg_errors(void) {
     return mp_obj_new_int(amyboard_i2c_bg_errors());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_i2c_bg_errors_obj, tulip_i2c_bg_errors);
+
+#ifdef CYNTHIA
+extern void cynthia_get_knobs(float *out_knobs, uint8_t count);
+extern void cynthia_get_joystick(float *out_x, float *out_y, bool *out_btn);
+extern uint8_t cynthia_get_buttons(void);
+extern bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind);
+extern int8_t cynthia_get_octave_shift(void);
+extern void cynthia_set_octave_shift(int8_t shift);
+extern void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port);
+extern int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str);
+extern int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color);
+extern float cynthia_ui_battery_voltage(void);
+#else
+static inline void cynthia_get_knobs(float *out_knobs, uint8_t count) {
+    if (out_knobs) {
+        for (uint8_t i = 0; i < count; i++) out_knobs[i] = 0.0f;
+    }
+}
+static inline void cynthia_get_joystick(float *out_x, float *out_y, bool *out_btn) {
+    if (out_x) *out_x = 0.5f;
+    if (out_y) *out_y = 0.5f;
+    if (out_btn) *out_btn = false;
+}
+static inline uint8_t cynthia_get_buttons(void) { return 0; }
+static inline bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind) { return false; }
+static inline int8_t cynthia_get_octave_shift(void) { return 0; }
+static inline void cynthia_set_octave_shift(int8_t shift) {}
+static inline void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port) {
+    if (out_loops) *out_loops = 0;
+    if (out_ads_reads) *out_ads_reads = 0;
+    if (out_ads_present) *out_ads_present = 0;
+    if (out_ads_port) *out_ads_port = 0;
+}
+static inline int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str) { return 0; }
+static inline int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color) { return 0; }
+static inline float cynthia_ui_battery_voltage(void) { return 4.12f; }
+#endif
+
+STATIC mp_obj_t tulip_cynthia_knobs(void) {
+    float knobs[16];
+    cynthia_get_knobs(knobs, 16);
+    mp_obj_t items[16];
+    for (int i = 0; i < 16; i++) {
+        items[i] = mp_obj_new_float(knobs[i]);
+    }
+    return mp_obj_new_tuple(16, items);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_knobs_obj, tulip_cynthia_knobs);
+
+STATIC mp_obj_t tulip_cynthia_joystick(void) {
+    float x = 0.5f, y = 0.5f;
+    bool btn = false;
+    cynthia_get_joystick(&x, &y, &btn);
+    mp_obj_t items[3] = {
+        mp_obj_new_float(x),
+        mp_obj_new_float(y),
+        mp_obj_new_bool(btn)
+    };
+    return mp_obj_new_tuple(3, items);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_joystick_obj, tulip_cynthia_joystick);
+
+STATIC mp_obj_t tulip_cynthia_buttons(void) {
+    return mp_obj_new_int(cynthia_get_buttons());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_buttons_obj, tulip_cynthia_buttons);
+
+STATIC mp_obj_t tulip_cynthia_button_event(void) {
+    uint8_t btn, kind;
+    if (cynthia_get_button_event(&btn, &kind)) {
+        mp_obj_t items[2] = {
+            mp_obj_new_int(btn),
+            mp_obj_new_int(kind)
+        };
+        return mp_obj_new_tuple(2, items);
+    }
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_button_event_obj, tulip_cynthia_button_event);
+
+STATIC mp_obj_t tulip_cynthia_octave_shift(size_t n_args, const mp_obj_t *args) {
+    if (n_args > 0) {
+        cynthia_set_octave_shift((int8_t)mp_obj_get_int(args[0]));
+    }
+    return mp_obj_new_int(cynthia_get_octave_shift());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_octave_shift_obj, 0, 1, tulip_cynthia_octave_shift);
+
+STATIC mp_obj_t tulip_cynthia_status(void) {
+    uint32_t loops = 0, ads_reads = 0;
+    uint8_t ads_present = 0, ads_port = 0;
+    cynthia_get_debug_status(&loops, &ads_reads, &ads_present, &ads_port);
+    mp_obj_t items[4] = {
+        mp_obj_new_int(loops),
+        mp_obj_new_int(ads_reads),
+        mp_obj_new_bool(ads_present),
+        mp_obj_new_int(ads_port)
+    };
+    return mp_obj_new_tuple(4, items);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_status_obj, tulip_cynthia_status);
+
+STATIC mp_obj_t tulip_cynthia_str_width(mp_obj_t font_idx_obj, mp_obj_t str_obj) {
+    uint8_t font_idx = (uint8_t)mp_obj_get_int(font_idx_obj);
+    const char *str = mp_obj_str_get_str(str_obj);
+    return mp_obj_new_int(cynthia_ui_str_width(font_idx, str));
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(tulip_cynthia_str_width_obj, tulip_cynthia_str_width);
+
+STATIC mp_obj_t tulip_cynthia_draw_str(size_t n_args, const mp_obj_t *args) {
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(args[0], &bufinfo, MP_BUFFER_WRITE);
+    uint8_t font_idx = (uint8_t)mp_obj_get_int(args[1]);
+    int16_t x = (int16_t)mp_obj_get_int(args[2]);
+    int16_t y = (int16_t)mp_obj_get_int(args[3]);
+    const char *str = mp_obj_str_get_str(args[4]);
+    uint8_t color = 1;
+    if (n_args > 5) {
+        color = (uint8_t)mp_obj_get_int(args[5]);
+    }
+    int16_t adv = cynthia_ui_draw_str((uint8_t *)bufinfo.buf, font_idx, x, y, str, color);
+    return mp_obj_new_int(adv);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_draw_str_obj, 5, 6, tulip_cynthia_draw_str);
+
+STATIC mp_obj_t tulip_cynthia_battery_voltage(void) {
+    return mp_obj_new_float(cynthia_ui_battery_voltage());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_battery_voltage_obj, tulip_cynthia_battery_voltage);
+
 #endif // ESP_PLATFORM
 
 
@@ -1841,15 +1975,26 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_set_cv_synth), MP_ROM_PTR(&tulip_set_cv_synth_obj)},
 #endif
 
-#ifdef AMYBOARD
+#if defined(AMYBOARD) || defined(CYNTHIA)
     { MP_ROM_QSTR(MP_QSTR_amyboard_send), MP_ROM_PTR(&tulip_amyboard_send_obj) },
     { MP_ROM_QSTR(MP_QSTR_amyboard_start), MP_ROM_PTR(&tulip_amyboard_start_obj) },
+#ifdef AMYBOARD
     { MP_ROM_QSTR(MP_QSTR_amyboard_set_midi_out), MP_ROM_PTR(&tulip_amyboard_set_midi_out_obj) },
+#endif
     { MP_ROM_QSTR(MP_QSTR_bootloader_mode), MP_ROM_PTR(&tulip_bootloader_mode_obj) },
 #ifdef ESP_PLATFORM
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_write), MP_ROM_PTR(&tulip_i2c_bg_write_obj) },
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_pending), MP_ROM_PTR(&tulip_i2c_bg_pending_obj) },
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_errors), MP_ROM_PTR(&tulip_i2c_bg_errors_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_knobs), MP_ROM_PTR(&tulip_cynthia_knobs_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_joystick), MP_ROM_PTR(&tulip_cynthia_joystick_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_buttons), MP_ROM_PTR(&tulip_cynthia_buttons_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_button_event), MP_ROM_PTR(&tulip_cynthia_button_event_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_octave_shift), MP_ROM_PTR(&tulip_cynthia_octave_shift_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_status), MP_ROM_PTR(&tulip_cynthia_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_str_width), MP_ROM_PTR(&tulip_cynthia_str_width_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_draw_str), MP_ROM_PTR(&tulip_cynthia_draw_str_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_battery_voltage), MP_ROM_PTR(&tulip_cynthia_battery_voltage_obj) },
 #endif
 #else
     #if !defined(AMYBOARD_WEB) && !defined(AMYBOARD_VCV)

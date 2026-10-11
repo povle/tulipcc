@@ -5,7 +5,8 @@ from _tulip import *
 from upysh import cd, pwd
 import amy
 
-if board() != 'AMYBOARD' and board() != "AMYBOARD_WEB" and board() != "AMYBOARD_VCV":
+# CYNTHIA is headless - skip graphics/UI imports
+if board() != 'AMYBOARD' and board() != "AMYBOARD_WEB" and board() != "AMYBOARD_VCV" and board() != "CYNTHIA":
     from tulip_graphics import *
     from ui import *
     from editor import edit

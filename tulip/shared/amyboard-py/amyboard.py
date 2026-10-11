@@ -440,7 +440,9 @@ def environment_transfer_done(*_args):
 
 
 def mount_sd():
-    # mount the SD card if given
+    # SD card is only on AMYBOARD; CYNTHIA has no SD slot
+    if tulip.board() != "AMYBOARD":
+        return
     import machine, uos
     try:
         sd = machine.SDCard(sck=12, miso=13, mosi=11, cs=10,slot=2)
@@ -510,8 +512,12 @@ def start_amy():
     # AMY binds its MIDI UART TX to this pin at start; set_midi_type() right after is
     # the single MIDI OUT init sequence (it also holds the unused TRS leg high). It
     # needs AMY's UART driver, which amy_start() installs, so it must come second.
-    tulip.amyboard_start(_MIDI_OUT_PINS[_midi_type])
-    set_midi_type(_midi_type)
+    # CYNTHIA has no MIDI hardware, pass -1 to skip UART binding and avoid GPIO conflicts.
+    if tulip.board() == "CYNTHIA":
+        tulip.amyboard_start(-1 & 0xFF)  # uint8_t: -1 becomes 255, AMY treats as "no MIDI"
+    else:
+        tulip.amyboard_start(_MIDI_OUT_PINS[_midi_type])
+        set_midi_type(_midi_type)
     tulip.amy_overload_callback(_on_amy_overload)
     # Boot defaults so the board makes sound before (or without) a sketch:
     # the amyboard patch on channel 1 and GM drums (kit 0, TR-808) on channel
@@ -880,6 +886,9 @@ def write_register(addr, reg, val):
     get_i2c().writeto(addr, bytes([reg, val]))
 
 def init_pcm9211(addr=0x40):
+    # PCM9211 is only on AMYBOARD; CYNTHIA has PCM5102A instead
+    if tulip.board() != "AMYBOARD":
+        return
     registers = [
         [ 0x40, 0x33 ], # Power down ADC, power down DIR, power down DIT, power down OSC
         [ 0x40, 0xc0 ], # Normal operation for all
@@ -909,7 +918,12 @@ def init_gp8413(addr=88):
     but 26+ parts (v1.5 boards) default to half that, leaving CV out
     spanning only -10v..0v. 0x11 selects the correct range on both
     batches (bench-verified a no-op on 25+). The setting is volatile, so
-    this must run every boot before any CV output."""
+    this must run every boot before any CV output.
+
+    No-op on boards without the GP8413 (e.g. CYNTHIA) — probing a missing
+    device raises ENODEV."""
+    if not cv_capable():
+        return
     get_i2c().writeto_mem(addr, 0x01, bytes([0x11]))
 
 def set_cv_out(channel=0, synth=1):

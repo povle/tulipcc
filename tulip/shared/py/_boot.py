@@ -1,16 +1,23 @@
 import gc
 import uos
+print("_boot: importing modules...")
 import tulip, sys, midi, synth, amy, world, sequencer
+print("_boot: modules imported")
 from upysh import *
 from tulip import board
+print("_boot: board =", board())
 
-if board()!="AMYBOARD" and board()!="AMYBOARD_WEB" and board()!="AMYBOARD_VCV":
+if board()!="AMYBOARD" and board()!="AMYBOARD_WEB" and board()!="AMYBOARD_VCV" and board()!="CYNTHIA":
     from tulip import edit, run
 else:
     if board()=="AMYBOARD":
         import amyboard
         amyboard.mount_sd()
         edit = amyboard.edit
+    elif board()=="CYNTHIA":
+        print("_boot: importing amyboard...")
+        import amyboard
+        print("_boot: amyboard imported")
     elif board()=="AMYBOARD_VCV":
         import amyboard
 
@@ -26,16 +33,33 @@ else:
 
 
 try:
+    print("_boot: importing Partition...")
     from esp32 import Partition
+    print("_boot: finding partitions...")
     try:
         s = Partition.find(Partition.TYPE_DATA, label="system")[0]
         u = Partition.find(Partition.TYPE_DATA, label="vfs")[0]
-        uos.mount(s,"/sys")
-        uos.mount(u,"/user")
+        print("_boot: partitions found")
+        try:
+            uos.mount(s,"/sys")
+        except OSError:
+            # First boot: format the system partition and retry
+            print("Formatting system partition...")
+            uos.VfsFat.mkfs(s)
+            uos.mount(s,"/sys")
+        try:
+            uos.mount(u,"/user")
+        except OSError:
+            # First boot: format the vfs partition and retry
+            print("Formatting user partition...")
+            uos.VfsFat.mkfs(u)
+            uos.mount(u,"/user")
         cd('/user')
         sys.path.append("/sys/ex")
+        print("_boot: partitions mounted")
         
-    except:
+    except Exception as e:
+        print("_boot: partition error:", e)
         print("Tulip flash not setup properly. Try resetting the device.")
 
     try:
@@ -143,7 +167,27 @@ if board() == "AMYBOARD" or board()=="AMYBOARD_WEB" or board()=="AMYBOARD_VCV":
     import amyboard
     amyboard.ensure_user_environment()
     amyboard.init_display()
-    
+
+if board() == "CYNTHIA":
+    import amyboard
+    print("_boot: CYNTHIA ensure_user_environment...")
+    amyboard.ensure_user_environment()
+    print("_boot: CYNTHIA ensure_user_environment done")
+    # CYNTHIA is headless - skip init_display()
+    # CYNTHIA boot flow (§17): restore the last-selected instrument's
+    # sketch.py into /user/current/ BEFORE start_amy() runs it. The
+    # interactive browser is a REPL command (cynthia.browser.run()) —
+    # boot must not block on input() headless.
+    try:
+        from cynthia import browser as _browser
+        _last = _browser.restore_last()
+        if _last:
+            print("_boot: CYNTHIA restoring instrument %r" % _last)
+        else:
+            print("_boot: CYNTHIA no instrument yet — run cynthia.browser.run() at the REPL")
+    except Exception as _e:
+        print("_boot: CYNTHIA restore failed:", _e)
+
 if board() == "AMYBOARD":
     amyboard.start_amy()
     # Run the self-test if the boot button is now held down.
@@ -154,9 +198,36 @@ if board() == "AMYBOARD_VCV":
     # In-process AMY was started by the Rack module before MicroPython booted.
     amyboard.start_amy()
 
+if board() == "CYNTHIA":
+    print("_boot: CYNTHIA start_amy...")
+    amyboard.start_amy()
+    print("_boot: CYNTHIA start_amy done")
+    # Daughterboard registry + ADS manager come up after AMY is running.
+    try:
+        from cynthia import registry, ads, config as cynthia_config
+        # First boot: seed /user/daughterboard.json with the stock Spark
+        # wiring (spark_main + spark_pots_legacy) so the drivers come up.
+        # Idempotent — an existing file is never touched.
+        cynthia_config.seed_default()
+        _cfg = cynthia_config.load()
+        ads.setup(chip=_cfg.get("adc_chip", "ads1115"))
+        registry.start()
+        # Attach the runtime to the instrument start_amy() just ran, so
+        # pots/buttons/display are routed to its engine (§17 PLAY mode).
+        from cynthia import runtime as _runtime, browser as _browser
+        _runtime.attach_current(_browser.last_instrument())
+    except Exception as _e:
+        print("_boot: CYNTHIA cynthia init failed:", _e)
+
 # We don't do most of Tulip's MIDI, but setup the MIDI callback hook so midi.add_callback(fn) will work.
-if board() == "AMYBOARD" or board() == "AMYBOARD_WEB" or board() == "AMYBOARD_VCV":
+if board() == "AMYBOARD" or board() == "AMYBOARD_WEB" or board() == "AMYBOARD_VCV" or board() == "CYNTHIA":
+    print("_boot: setting up MIDI callback...")
     tulip.midi_callback(midi.c_fired_midi_event)
+    print("_boot: MIDI callback done")
 
 if board() != "AMYBOARD" and board() != "AMYBOARD_WEB" and board() != "AMYBOARD_VCV":
+    print("_boot: midi.setup()...")
     midi.setup() # Just mirrors the setup mostly managed by AMY for Tulip-REPL systems.
+    print("_boot: midi.setup() done")
+
+print("_boot: complete!")

@@ -1,0 +1,18 @@
+{
+    "deploy": [
+        "../deploy_s3.md"
+    ],
+    "docs": "",
+    "features": [
+        "BLE",
+        "USB",
+        "I2S",
+        "I2C"
+    ],
+    "images": [],
+    "mcu": "esp32s3",
+    "product": "CYNTHIA",
+    "thumbnail": "",
+    "url": "",
+    "vendor": "Custom"
+}
