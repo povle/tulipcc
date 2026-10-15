@@ -338,6 +338,11 @@ def joystick():
         jx = max(0.0, min(1.0, _cal(jx, cx, lo_x, hi_x)))
         jy = max(0.0, min(1.0, _cal(jy, cy, lo_y, hi_y)))
 
+    # C++ Controls.readJoystick() ends with `outY = 1.0f - outY` ("Reverse"),
+    # so every consumer (menu, patch list, mod wheel) gets one convention:
+    # push away = 1.0. Apply it here, once, at the reader — not per-caller.
+    jy = 1.0 - jy
+
     return (jx, jy, btn)
 
 

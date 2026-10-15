@@ -251,32 +251,81 @@ All steps are isolated, CYNTHIA-guarded, and keep upstream merges mechanical
 - Always `rm -rf build` when switching `-DMICROPY_BOARD=` targets.
 ---
 
-## 9. Cynthia UI & U8G2 Font Rendering Findings (2026-10-09)
+## 10. Cynthia UI Implementation (completed 2026-10-12)
 
-### Objective
-Port the Cynthia synth UI from original C++ U8G2 firmware (`projects/synth`) to MicroPython/Cynthia with font fidelity, UI controls, and navigation modes on SH1106 OLED (128x64).
+### 10a. U8G2 Font Engine (C)
 
-### Key Architecture Findings
-1. **Fonts Needed**:
-   - `u8g2_font_5x7_tr` (status bar, headers, labels)
-   - `u8g2_font_4x6_tr` (micro labels, slider annotations)
-   - `u8g2_font_7x13_tr` (sampler / status values)
-   - `u8g2_font_tenfatguys_tf` (patch names, bold titles)
-   - `u8g2_font_tenthinnerguys_tf` (instrument grid menu labels)
-   - `u8g2_font_resoledbold_tr` (synth name in status bar header)
-   - `u8g2_font_spleen12x24_mu` (large readout numbers)
-   - Font source arrays are located in `/Users/pasha/Documents/Arduino/libraries/U8g2/src/clib/u8g2_fonts.c`.
-2. **Font Rendering Pipeline**:
-   - Existing U8G2 renderer in `tulip/shared/u8g2_fonts.c` uses run-length decoding (`u8g2_font_decode_len`).
-   - Cynthia display buffer is 1024 bytes (128x64 `framebuf.MONO_VLSB`), where byte `page * 128 + x` has bit `(y % 8)` set.
-   - We implement `cynthia_ui.c` (or add directly to `u8g2_fonts.c` / `modtulip.c`) containing:
-     - The 7 font data arrays.
-     - `tulip.cynthia_draw_str(buf, font_idx, x, y, str, color)` rendering directly into `MONO_VLSB` buffer with clipping.
-     - `tulip.cynthia_str_width(font_idx, str)` calculating exact advance width in pixels.
-     - `tulip.cynthia_battery_voltage()` reading ADC on GPIO 7.
-3. **UI Layout Matching**:
-   - Status header: Octave (`OCT:%+d`), Synth Name centered in `resoledbold_tr`, Battery Voltage in `5x7_tr`, divider line at y=10.
-   - Patch title: wrapped with `tenfatguys_tf`.
-   - Grid instrument menu: 2x3 grid, cells 42x23, font `tenthinnerguys_tf`.
-   - Juno UI: 5 columns (DCO, HPF, VCF, LFO, ENV) with custom sliders, dual triangles, waveform icons.
-   - DX7 UI: 6 operators with connection lines and carrier XOR inversion.
+File: `tulip/amyboard/boards/CYNTHIA/cynthia_ui.c` + `cynthia_fonts.h` + `cynthia_ui.h`
+
+7 fonts fetched from upstream U8g2 repo (`single_font_files/`) and compiled into firmware:
+- `u8g2_font_5x7_tr` (status bar, headers, labels)
+- `u8g2_font_4x6_tr` (micro labels, slider annotations)
+- `u8g2_font_7x13_tr` (sampler / status values)
+- `u8g2_font_tenfatguys_tf` (patch names, bold titles)
+- `u8g2_font_tenthinnerguys_tf` (instrument grid menu labels)
+- `u8g2_font_resoledbold_tr` (synth name in status bar header)
+- `u8g2_font_spleen12x24_mu` (large readout numbers)
+
+Exposed as:
+- `tulip.cynthia_draw_str(buf, font_idx, x, y, str, color=1)` — renders into 1024-byte MONO_VLSB buffer
+- `tulip.cynthia_str_width(font_idx, str)` — exact advance width (with U8G2 last-glyph adjustment)
+- `tulip.cynthia_battery_voltage()` — reads ESP32 ADC on BATT_LVL (GPIO 1)
+
+Added to `MICROPY_SOURCE_BOARD` in `mpconfigboard.cmake` and registered in `modtulip.c`.
+
+### 10b. C Input Task (already documented in §4)
+
+`cynthia_input.c`: keyboard, pots, buttons, joystick. Pots now prescan all 16 channels at init
+so first Python poll sees real values (no ramp from 0.5 overwriting patch params).
+
+### 10c. Display Driver (`cynthia/display.py`)
+
+SH1106 128×64 via I2C. `SH1106` class with `framebuf.MONO_VLSB` backing.
+Additional methods on the display object:
+- `draw_str(font_idx, x, y, str, col)` — U8G2 font rendering pass-through to C
+- `str_width(font_idx, str)` — pass-through to C
+- `draw_header(octave, battery_v, inst_name, joystick_xy=None)` — status bar
+- `draw_instrument_grid(instruments[], cursor_row, cursor_col)` — 2×3 grid
+
+Font constants: `FONT_5X7` through `FONT_SPLEEN12X24` as module-level ints.
+
+### 10d. Runtime (`cynthia/runtime.py`)
+
+- `play(name)` / `stop()` / `attach_current(name)` — boot + browser→play transitions
+- `_poll(tick)` — paced at ~96Hz via TulipSequence, routes pot changes, joystick MIDI, button events
+- Joystick X → pitch bend, Y → CC1 modulation, every poll cycle
+- Menu opens on **long-press joystick button** (index 4, 800ms), navigates with joystick axes
+- Short-press joystick button in menu = **select instrument**
+- **Param name overlay**: last turned knob shows parameter name + `NN%` for 500ms in header bar.
+  Falls back to standard names from `_POT_NAMES[16]` table; instruments can optionally override
+  with `engine.pot_name(ch)`.
+- **User patch system**: `save_patch(inst, idx, name, state)`, `load_patch(inst, idx)`,
+  `list_user_patches(inst)`, `delete_patch(inst, idx)` — JSON files under `/user/patches/`.
+
+### 10e. Instruments
+
+| Instrument | File | Patches | Voices | Pot Mapping |
+|-----------|------|---------|--------|-------------|
+| Juno-106   | `instruments/juno.py` | 128 built-in (AMY 0-127) | 6 | 16 params via `POT_MAP_16` + `POT_NAMES` |
+| DX7        | `instruments/dx7.py` | 128 built-in (AMY 128-255) | 8 | Locked (DX7 has no front-panel editing) |
+
+Juno `update_pot()` handles all 16 channels matching `InstrumentJuno.cpp`:
+0→dco_pwm, 1→saw (binary), 2→dco_sub, 3→hpf (quantized), 4→lfo_rate,
+5→vcf_lfo, 6→lfo_target (no-op), 7→vcf_freq, 8→vcf_res, 9→env_a,
+10→env_d, 11→env_s, 12→env_r, 13→delay level (amy.echo),
+14→delay time (amy.echo), 15→dco_noise.
+
+### 10f. Joystick Calibration
+
+- `surface.calibrate_joystick(samples=200)` — quick center sample
+- `surface.calibrate_joystick_full()` — guided center + range via button presses
+- `runtime.calibrate_ui()` — display-guided version with on-screen prompts
+- Calibration saved to `/user/joystick_cal.json`, applied live via center-offset + deadzone
+
+### 10g. Known Issues / Status
+
+- Boot init fixed: C task now prescans all 16 pots + joystick before Python runtime starts.
+- Knob takeover: `_last = []` in `surface.start()` ensures first `knob_changes()` aligns to hardware.
+- DX7 carrier boxes use `fill_rect` + black text (not broken XOR).
+- Custom patch save/load API is in place; button-triggered patch browser UI is pending.
+- Battery voltage returns to normal header (joystick display removed).

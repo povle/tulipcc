@@ -171,6 +171,10 @@ static void mcp_init(i2c_port_t port, uint8_t addr) {
     i2c_read_reg16(port, addr, MCP_INTCAPA, &dummy);
 }
 
+// Forward declarations for init prescan
+static void read_pot_mux(uint8_t pot_idx);
+static void read_joystick_axes(void);
+
 void cynthia_input_init(void) {
     fprintf(stderr, "cynthia_input_init: configuring I2C buses...\n"); fflush(stderr);
 
@@ -258,6 +262,21 @@ void cynthia_input_init(void) {
     } else {
         fprintf(stderr, "cynthia_input: ADS1115 at 0x48 NOT detected on either I2C bus\n"); fflush(stderr);
     }
+
+    // 5. Full initial prescan: read all 16 pots + joystick so real values
+    //    are available from the first Python poll, eliminating the ramp
+    //    from 0.5→real that would override freshly-loaded patch params.
+    fprintf(stderr, "cynthia_input_init: prescanning pots...\n"); fflush(stderr);
+    for (uint8_t i = 0; i < CYNTHIA_NUM_POTS; i++) {
+        s_first_pot_read[i] = false;
+        read_pot_mux(i);
+        if (i % 4 == 0) vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    // Joystick is read read_joystick_axes inside the loop.
+    s_first_joy_x_read = false;
+    s_first_joy_y_read = false;
+    read_joystick_axes();
+    fprintf(stderr, "cynthia_input_init: prescan done.\n"); fflush(stderr);
 }
 
 static inline void set_mux_channel(uint8_t ch) {

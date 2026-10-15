@@ -56,6 +56,85 @@ _POT_NAMES = [
     "Resonance", "Attack", "Decay", "Sustain",
     "Release", "Delay", "Delay T", "Glide",
 ]
+
+# --- User patch system (§12) ---
+
+PATCHES_DIR = "/user/patches"
+
+
+def _patches_dir(inst_name):
+    return PATCHES_DIR + "/" + inst_name
+
+
+def save_patch(inst_name, idx, name, state_dict):
+    """Save a user patch as JSON under /user/patches/<inst_name>/<idx>.json.
+    state_dict is whatever the instrument wants to persist.
+    Returns True on success."""
+    import os, json
+    d = _patches_dir(inst_name)
+    try:
+        os.mkdir(PATCHES_DIR)
+    except OSError:
+        pass
+    try:
+        os.mkdir(d)
+    except OSError:
+        pass
+    path = d + "/" + str(idx) + ".json"
+    try:
+        with open(path, "w") as f:
+            json.dump({"name": name, "state": state_dict}, f)
+        return True
+    except OSError:
+        return False
+
+
+def load_patch(inst_name, idx):
+    """Load a user patch dict from JSON, or None."""
+    import json
+    path = _patches_dir(inst_name) + "/" + str(idx) + ".json"
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def delete_patch(inst_name, idx):
+    """Delete a user patch file."""
+    import os
+    path = _patches_dir(inst_name) + "/" + str(idx) + ".json"
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def list_user_patches(inst_name):
+    """Return sorted list of (idx, name) for saved user patches."""
+    import os, json
+    d = _patches_dir(inst_name)
+    try:
+        files = os.listdir(d)
+    except OSError:
+        return []
+    result = []
+    for fname in files:
+        if fname.endswith(".json"):
+            try:
+                idx = int(fname[:-5])
+                with open(d + "/" + fname) as fp:
+                    data = json.load(fp)
+                result.append((idx, data.get("name", "Patch %d" % idx)))
+            except (OSError, ValueError):
+                continue
+    result.sort()
+    return result
+
+
+def count_user_patches(inst_name):
+    return len(list_user_patches(inst_name))
 # 48 PPQ / 120 BPM advances 96 ticks/sec, so 1 tick ~= 10ms -> ~100Hz control
 # poll. The display redraws every _DISPLAY_EVERY polls (~33fps, §8 >=15fps).
 _DISPLAY_EVERY = 3
@@ -329,6 +408,12 @@ def _poll(tick):
     if _menu_active:
         if joy is not None:
             _handle_joystick_menu(jx, jy)
+    elif _patch_list_active:
+        if joy is not None:
+            _handle_joystick_patch_list(jx, jy)
+    elif _save_menu_active:
+        if joy is not None:
+            _handle_joystick_save_menu(jx, jy)
 
     # Route control-button events.
     for ev in surface.events():
@@ -386,8 +471,49 @@ def _handle_joystick_menu(jx, jy):
         _draw_ui()
 
 
+def _handle_joystick_patch_list(jx, jy):
+    """Joystick navigation in patch list mode (matching C++ handlePatchListNav).
+    UP/DOWN: scroll cursor. LEFT/RIGHT: toggle between [Default] and [User]."""
+    global _patch_list_cursor, _patch_list_user, _patch_list_items, _last_menu_nav_time
+    import time as _time
+    now = _time.ticks_ms()
+    if now - _last_menu_nav_time < 150:
+        return
+
+    jx_bip = (jx - 0.5) * 2.0
+    changed = False
+
+    # Switch folders (left=Default, right=User)
+    if jx_bip < -0.3 and _patch_list_user:
+        _patch_list_user = False
+        _patch_list_cursor = 0
+        _rebuild_patch_list()
+        changed = True
+    elif jx_bip > 0.3 and not _patch_list_user:
+        _patch_list_user = True
+        _patch_list_cursor = 0
+        _rebuild_patch_list()
+        changed = True
+
+    # Vertical cursor scroll
+    count = len(_patch_list_items)
+    if count > 0:
+        if jy > 0.65:
+            _patch_list_cursor = (count - 1) if _patch_list_cursor == 0 else (_patch_list_cursor - 1)
+            changed = True
+        elif jy < 0.35:
+            _patch_list_cursor = 0 if _patch_list_cursor >= count - 1 else (_patch_list_cursor + 1)
+            changed = True
+
+    if changed:
+        _last_menu_nav_time = now
+        _draw_ui()
+
+
 def _handle_event(ev):
     global _menu_active, _menu_row, _menu_col, _menu_insts
+    global _patch_list_active, _patch_list_cursor
+    global _save_menu_active, _save_menu_save_selected
     if not ev:
         return
 
@@ -426,7 +552,60 @@ def _handle_event(ev):
                     _draw_ui()
             return
 
+        if _save_menu_active:
+            if kind == "short_press" and idx == 4:
+                # Joystick click confirms (C++ saveMenuReadyToConfirm && joyClicked)
+                if _save_menu_save_selected:
+                    sname = _engine.get_patch_name() if _engine and hasattr(_engine, "get_patch_name") else None
+                    new_idx = _do_save_current_patch()
+                    _save_menu_active = False
+                    if new_idx is not None:
+                        # C++ switches to the User folder showing the new patch.
+                        global _patch_list_active, _patch_list_user, _patch_list_cursor
+                        _patch_list_active = True
+                        _patch_list_user = True
+                        _rebuild_patch_list()
+                        _patch_list_cursor = len(_patch_list_items) - 1
+                        if _patch_list_cursor < 0:
+                            _patch_list_cursor = 0
+                    _draw_ui()
+                else:
+                    _close_save_menu()
+                return
+            if kind == "short_press" and idx == BTN_PATCH_PREV:
+                # C++: short-press button 2 cancels a nav state.
+                _close_save_menu()
+                return
+            return
+
+        if _patch_list_active:
+            if kind == "short_press" and idx == 4:
+                # Joystick click = select patch
+                _select_current_patch_list_item()
+                _patch_list_active = False
+                _draw_ui()
+                return
+            if kind == "short_press":
+                count = len(_patch_list_items)
+                if count > 0:
+                    if idx == BTN_PATCH_PREV:
+                        _patch_list_cursor = max(0, _patch_list_cursor - 1)
+                        _draw_ui()
+                    elif idx == BTN_PATCH_NEXT:
+                        _patch_list_cursor = min(count - 1, _patch_list_cursor + 1)
+                        _draw_ui()
+            return
+
         # Not in menu: route button to normal functions.
+        # C++ System.cpp: long-press btn2 (prev) → SAVE menu; long-press btn3
+        # (next) → patch LIST. Short press keeps normal patch navigation.
+        if kind == "long_press":
+            if idx == BTN_PATCH_PREV and _engine is not None and hasattr(_engine, "save_patch_state"):
+                _open_save_menu()
+            elif idx == BTN_PATCH_NEXT:
+                _toggle_patch_list()
+            return
+
         if kind != "short_press":
             return
         if idx == BTN_OCTAVE_DOWN:
@@ -441,6 +620,180 @@ def _handle_event(ev):
             print("cynthia: patch", prev_patch())
         elif idx == BTN_PATCH_NEXT:
             print("cynthia: patch", next_patch())
+
+
+# --- Patch save/load UI helpers ---
+
+_patch_list_active = False
+_patch_list_cursor = 0
+_patch_list_user = False       # False = ROM patches, True = user patches
+_patch_list_items = []          # [(idx, name), ...]
+_save_menu_active = False
+_save_menu_save_selected = True  # True = Save highlighted, False = Cancel
+
+
+def _open_save_menu():
+    """C++ System.cpp: long-press button 2 in PATCH_NAV_NORMAL enters NAV_SAVE."""
+    global _save_menu_active, _save_menu_save_selected
+    _save_menu_active = True
+    _save_menu_save_selected = True   # C++ defaults to Save selected
+    _draw_ui()
+
+
+def _close_save_menu():
+    global _save_menu_active
+    _save_menu_active = False
+    _draw_ui()
+
+
+def _toggle_patch_list():
+    """Toggle patch-list overlay (C++ PATCH_NAV_LIST mode)."""
+    global _patch_list_active, _patch_list_cursor, _patch_list_user, _patch_list_items
+    _patch_list_active = not _patch_list_active
+    if _patch_list_active:
+        # C++ seeds the cursor from the active patch index / folder.
+        _patch_list_user = False
+        _patch_list_cursor = _engine.current() if _engine and hasattr(_engine, "current") else 0
+        _rebuild_patch_list()
+        if _patch_list_cursor >= len(_patch_list_items):
+            _patch_list_cursor = 0
+    _draw_ui()
+
+
+def _rebuild_patch_list():
+    global _patch_list_items, _patch_list_user
+    import os
+    if _patch_list_user:
+        _patch_list_items = list_user_patches(_name) if _name else []
+    else:
+        n = _engine.count() if _engine and hasattr(_engine, "count") else 0
+        _patch_list_items = [(i, _engine.name(i)) for i in range(n)] if _engine else []
+
+
+def _do_save_current_patch():
+    """Save the current instrument patch as a new user patch slot."""
+    if _engine is None or _name is None:
+        return None
+    idx = count_user_patches(_name)
+    state = _engine.save_patch_state()
+    pname = _engine.get_patch_name() if hasattr(_engine, "get_patch_name") else "Patch %d" % idx
+    if save_patch(_name, idx, pname, state):
+        print("cynthia: patch saved as %s/%d.json (%s)" % (_name, idx, pname))
+        return idx
+    print("cynthia: save failed")
+    return None
+
+
+def _draw_save_menu_ui(disp):
+    """Draw SAVE PATCH / Save / Cancel, matching C++ drawSaveMenu()."""
+    title = "SAVE PATCH"
+    title_w = disp.str_width(display.FONT_5X7, title)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - title_w) // 2), 18, title, 1)
+
+    cur = _engine.get_patch_name() if _engine and hasattr(_engine, "get_patch_name") else "---"
+    disp.draw_str(display.FONT_5X7, 2, 28, "Name: " + cur, 1)
+
+    btn_y, btn_w, btn_h = 40, 40, 14
+    btn_gap = (128 - 2 * btn_w) // 3
+
+    # Save button
+    save_x = btn_gap
+    if _save_menu_save_selected:
+        disp.fill_rect(save_x, btn_y, btn_w, btn_h, 1)
+        disp.draw_str(display.FONT_5X7, save_x + (btn_w - disp.str_width(display.FONT_5X7, "Save")) // 2,
+                      btn_y + 11, "Save", 0)
+    else:
+        disp.rect(save_x, btn_y, btn_w, btn_h, 1)
+        disp.draw_str(display.FONT_5X7, save_x + (btn_w - disp.str_width(display.FONT_5X7, "Save")) // 2,
+                      btn_y + 11, "Save", 1)
+
+    # Cancel button
+    cancel_x = 2 * btn_gap + btn_w
+    if not _save_menu_save_selected:
+        disp.fill_rect(cancel_x, btn_y, btn_w, btn_h, 1)
+        disp.draw_str(display.FONT_5X7, cancel_x + (btn_w - disp.str_width(display.FONT_5X7, "Cancel")) // 2,
+                      btn_y + 11, "Cancel", 0)
+    else:
+        disp.rect(cancel_x, btn_y, btn_w, btn_h, 1)
+        disp.draw_str(display.FONT_5X7, cancel_x + (btn_w - disp.str_width(display.FONT_5X7, "Cancel")) // 2,
+                      btn_y + 11, "Cancel", 1)
+
+
+def _handle_joystick_save_menu(jx, jy):
+    """C++ handleSaveMenuNav: LEFT selects Save, RIGHT selects Cancel."""
+    global _save_menu_save_selected, _last_menu_nav_time
+    import time as _time
+    now = _time.ticks_ms()
+    if now - _last_menu_nav_time < 200:
+        return
+    jx_bip = (jx - 0.5) * 2.0
+    if jx_bip < -0.2:
+        _save_menu_save_selected = True
+        _last_menu_nav_time = now
+        _draw_ui()
+    elif jx_bip > 0.2:
+        _save_menu_save_selected = False
+        _last_menu_nav_time = now
+        _draw_ui()
+
+
+def _select_current_patch_list_item():
+    """Load the patch under the patch list cursor."""
+    if not _patch_list_items or _patch_list_cursor >= len(_patch_list_items):
+        return
+    idx, name = _patch_list_items[_patch_list_cursor]
+    if _patch_list_user:
+        if _name and _engine and hasattr(_engine, "load_patch_state"):
+            data = load_patch(_name, idx)
+            if data and "state" in data:
+                _engine.load_patch_state(data["state"])
+                print("cynthia: loaded user patch %d (%s)" % (idx, name))
+    else:
+        set_patch(idx)
+        print("cynthia: loaded default patch %d (%s)" % (idx, name))
+
+
+def _draw_patch_list_ui(disp):
+    """Draw patch list view with 5 visible lines, matching C++ drawPatchList()."""
+    folder_label = "[User]" if _patch_list_user else "[Default]"
+    folder_w = disp.str_width(display.FONT_5X7, folder_label)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - folder_w) // 2), 18, folder_label, 1)
+
+    count = len(_patch_list_items)
+    if count == 0:
+        disp.draw_str(display.FONT_5X7, 30, 35, "<Empty>", 1)
+        return
+
+    visible_lines = 5
+    line_h = 8
+    start_y = 26
+
+    scroll_offset = 0
+    if _patch_list_cursor >= visible_lines:
+        scroll_offset = _patch_list_cursor - visible_lines + 1
+
+    for i in range(visible_lines):
+        item_idx = scroll_offset + i
+        if item_idx >= count:
+            break
+        y_pos = start_y + i * line_h
+        is_cur = (item_idx == _patch_list_cursor)
+
+        idx_val, patch_name = _patch_list_items[item_idx]
+        line_str = "%3d %s" % (idx_val + 1 if not _patch_list_user else idx_val, patch_name)
+
+        if is_cur:
+            disp.fill_rect(0, y_pos - 6, 128, line_h, 1)
+            disp.draw_str(display.FONT_5X7, 2, y_pos, line_str, 0)
+        else:
+            disp.draw_str(display.FONT_5X7, 2, y_pos, line_str, 1)
+
+    # Scrollbar on right edge
+    if count > visible_lines:
+        bar_h = max(4, (visible_lines * line_h * visible_lines) // count)
+        bar_y = start_y + (scroll_offset * (visible_lines * line_h - bar_h)) // (count - visible_lines)
+        disp.fill_rect(125, bar_y, 3, bar_h, 1)
+
 
 
 def _draw_ui():
@@ -490,6 +843,15 @@ def _draw_ui():
         disp.draw_instrument_grid(_menu_insts, _menu_row, _menu_col)
         disp.show()
         return
+    if _save_menu_active:
+        _draw_save_menu_ui(disp)
+        disp.show()
+        return
+    if _patch_list_active:
+        _draw_patch_list_ui(disp)
+        disp.show()
+        return
+
 
     if _engine is None or not hasattr(_engine, "draw_ui"):
         return

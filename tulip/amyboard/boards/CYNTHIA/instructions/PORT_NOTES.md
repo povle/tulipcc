@@ -260,6 +260,27 @@ This also enables `TUD_USB_GADGET` which is needed for `midi_out()` to send USB 
 **Symptom**: Modifying patch parameters in `juno.py` raised `AttributeError: 'JunoPatch' object has no attribute 'pwm_osc' / 'ctl_osc'`.
 **Cause**: `JunoInstrument.set_patch()` recreated the patch but omitted `init_AMY()`, leaving oscillator indices unassigned.
 **Fix**: Added `self.patch.init_AMY()` to `set_patch()` in `cynthia/instruments/juno.py`.
+### 18. Boot Pot Overwrite and Staggered Prescan Jump
+**Symptom**: On boot or preset load, knobs overrode instrument parameters immediately, and starting on DX7 reloaded a Juno sound once pots were read.
+**Cause**:
+1. `s_knob_values` was initialized to 0.0f (then 0.5f) and each channel was only scanned round-robin (1 channel every 5ms). Channels read later in the sequence jumped from 0.5f to their real values during the first ~80ms, triggering spurious `knob_changes()` events that called `update_pot()`.
+2. `surface.start()` initialized `_last = [-1.0] * 16`, guaranteeing all 16 pots would look like massive changes on first poll.
+**Fix**:
+1. Added full initial prescan of all 16 channels + joystick axes in `cynthia_input_init()` with `s_first_pot_read` snap-to-real logic.
+2. Initialized `_last = []` in `surface.start()`, letting `knob_changes()` align to real hardware positions on the first pass without firing changes.
+
+### 19. U8G2 Font Engine & Exact String Width Alignment
+**Symptom**: Font rendering missing on OLED; column headers and patch names misaligned.
+**Cause**: Original firmware used Arduino U8G2 font data. `framebuf` standard 8x8 font lacked glyph fidelity and advance metrics.
+**Fix**: Added `cynthia_ui.c` compiling 7 original U8G2 fonts into firmware with MONO_VLSB rendering (`tulip.cynthia_draw_str`), U8G2-exact advance width calculation (`tulip.cynthia_str_width`), and hardware battery ADC reading (`tulip.cynthia_battery_voltage`).
+
+### 20. Custom User Patch System
+**Symptom**: User edits to knobs were lost across reboots and patch switches.
+**Cause**: Only ROM presets existed in MicroPython instruments; no persistent save/load mechanism.
+**Fix**:
+1. Implemented JSON-backed user patch system under `/user/patches/<instrument>/<idx>.json` with `save_patch()`, `load_patch()`, `list_user_patches()`.
+2. Added `save_patch_state()` / `load_patch_state()` to `JunoInstrument` capturing all 28 synth parameters.
+3. Added interactive patch browser UI to `runtime.py`: long-press patch prev saves current state to user slot; long-press patch next toggles `[Default]` vs `[User]` patch list with scroll and joystick select.
 
 ## Current Status
 
@@ -279,7 +300,11 @@ This also enables `TUD_USB_GADGET` which is needed for `midi_out()` to send USB 
   - Fast C getters exposed to MicroPython (`tulip.cynthia_*`)
 - SH1106 I2C OLED display driver (on Bus 1)
 - Juno and DX7 engine patch parameter routing
-
+- U8G2 font rendering engine with 7 built-in fonts (`cynthia_ui.c`)
+- Universal 500ms knob parameter overlay on top header bar
+- Interactive 2x3 instrument grid menu (long-press joystick click to open, joystick to navigate, click to select)
+- Guided joystick calibration routine with flash persistence (`/user/joystick_cal.json`)
+- Custom user patch system with on-device save/load and patch list overlay
 ## Files Modified in tulipcc
 
 ### CMake

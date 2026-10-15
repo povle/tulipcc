@@ -154,6 +154,63 @@ class JunoInstrument:
             return JUNO_NAMES[self.patch_index]
         return "Patch %d" % self.patch_index
 
+    def save_patch_state(self):
+        """Return dict of current knob/state to persist as a user patch."""
+        if self.patch is None:
+            return {}
+        p = self.patch
+        return {
+            "patch_index": self.patch_index,
+            "lfo_rate": p.lfo_rate,
+            "lfo_delay_time": p.lfo_delay_time,
+            "dco_lfo": p.dco_lfo,
+            "dco_pwm": p.dco_pwm,
+            "dco_noise": p.dco_noise,
+            "vcf_freq": p.vcf_freq,
+            "vcf_res": p.vcf_res,
+            "vcf_env": p.vcf_env,
+            "vcf_lfo": p.vcf_lfo,
+            "vcf_kbd": p.vcf_kbd,
+            "vca_level": p.vca_level,
+            "env_a": p.env_a,
+            "env_d": p.env_d,
+            "env_s": p.env_s,
+            "env_r": p.env_r,
+            "dco_sub": p.dco_sub,
+            "stop_16": p.stop_16,
+            "stop_8": p.stop_8,
+            "stop_4": p.stop_4,
+            "pulse": p.pulse,
+            "saw": p.saw,
+            "pwm_manual": p.pwm_manual,
+            "vcf_neg": p.vcf_neg,
+            "vca_gate": p.vca_gate,
+            "chorus": p.chorus,
+            "hpf": p.hpf,
+            "portamento": p.portamento,
+        }
+
+    def load_patch_state(self, state):
+        """Restore instrument state from a user patch dict."""
+        if not state:
+            return
+        idx = state.get("patch_index", 0)
+        self.patch_index = idx % NUM_PATCHES
+        if not self._started:
+            self.init()
+            return
+        # Reload the base patch.
+        amy.send(synth=SYNTH, patch=self.patch_index)
+        self.patch = JunoPatch.from_patch_number(self.patch_index)
+        self.patch.set_synth(SYNTH)
+        # Apply all the knobs from the saved state.
+        for key, val in state.items():
+            if key == "patch_index":
+                continue
+            if hasattr(self.patch, key):
+                setattr(self.patch, key, val)
+        self.patch.init_AMY()
+
     def pot_name(self, channel):
         """Human-readable name for pot channel."""
         if 0 <= channel < len(POT_NAMES):
