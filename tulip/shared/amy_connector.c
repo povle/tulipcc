@@ -476,9 +476,7 @@ static void mount_gamma9001_drums(void) {
 #if (defined AMYBOARD) || (defined TULIP) || (defined CYNTHIA)
 
 void run_amy(uint8_t midi_out_pin) {
-    fprintf(stderr, "run_amy: start, midi_out_pin=%d\n", midi_out_pin);
     amy_config_t amy_config = amy_default_config();
-    fprintf(stderr, "run_amy: amy_default_config done\n");
     amy_config.amy_external_midi_input_hook = tulip_midi_input_hook;
 #ifdef TULIP_USER_C_DSP
     amy_config.amy_external_render_hook = tulip_render_hook_chain;
@@ -515,15 +513,12 @@ void run_amy(uint8_t midi_out_pin) {
     amy_config.features.audio_in = 0;
     amy_config.midi = AMY_MIDI_IS_UART;
 #endif
-    fprintf(stderr, "run_amy: audio=I2S, audio_in=%d, midi=%d\n", amy_config.features.audio_in, amy_config.midi);
     amy_config.features.default_synths = 0; // midi.py does this for us
     amy_config.i2s_lrc = CONFIG_I2S_LRCLK;
     amy_config.i2s_bclk = CONFIG_I2S_BCLK;
     amy_config.i2s_dout = CONFIG_I2S_DOUT;
     amy_config.i2s_din = CONFIG_I2S_DIN;
     amy_config.i2s_mclk = CONFIG_I2S_MCLK;
-    fprintf(stderr, "run_amy: I2S pins: bclk=%d, dout=%d, lrc=%d, din=%d, mclk=%d\n",
-            amy_config.i2s_bclk, amy_config.i2s_dout, amy_config.i2s_lrc, amy_config.i2s_din, amy_config.i2s_mclk);
     amy_config.midi_out = midi_out_pin;
     amy_config.midi_in = MIDI_IN_PIN;
 #ifndef AMYBOARD
@@ -532,9 +527,7 @@ void run_amy(uint8_t midi_out_pin) {
 #if defined(GAMMA9001) && defined(ESP_PLATFORM)
     mount_gamma9001_drums();
 #endif
-    fprintf(stderr, "run_amy: calling amy_start...\n");
     amy_start(amy_config);
-    fprintf(stderr, "run_amy: amy_start done\n");
     external_map = malloc_caps(amy_config.max_oscs, MALLOC_CAP_INTERNAL);
     for(uint16_t i=0;i<amy_config.max_oscs;i++) external_map[i] = 0;
     for(uint8_t i=0;i<MAX_CV_SYNTHS;i++) cv_synth_map[i] = 0;

@@ -307,24 +307,61 @@ This also enables `TUD_USB_GADGET` which is needed for `midi_out()` to send USB 
 - Custom user patch system with on-device save/load and patch list overlay
 ## Files Modified in tulipcc
 
-### CMake
-- `tulip/amyboard/esp32_common.cmake` - Removed hardcoded `AMYBOARD` define
+CYNTHIA is designed to touch upstream shorepine code as little as possible:
+**41 new files** (board dir + `cynthia-py/` package + bundled instruments) and
+**12 modified upstream files, ~340 lines total**. Everything else is new files.
 
-### C Code
-- `tulip/amyboard/main.c` - Added mp_main_task_handle init, guarded CYNTHIA-specific code
-- `tulip/shared/modtulip.c` - Added CYNTHIA to board() function, UI header guard
-- `tulip/shared/tulip_helpers.c` - Added CYNTHIA to ui.h exclusion guard
-- `tulip/shared/amy_connector.c` - Added CYNTHIA to hooks section, USB HOST MIDI exclusion, reordered audio_in check, added CYNTHIA to the 4 inner web-sysex hook guards (issue #12)
+### CMake (1 line removed)
+- `tulip/amyboard/esp32_common.cmake` - Removed the hardcoded `AMYBOARD` define.
+  Board identity now comes solely from `${BOARD_DEFINITION1}` (AMYBOARD and
+  TULIP4_R11 set their own; CYNTHIA sets `CYNTHIA`). Removed for CYNTHIA: the
+  hardcoded define forced I2S *slave* mode (PCM9211/SPDIF), which hangs
+  `i2s_channel_init_std_mode()` on CYNTHIA's PCM5102A (issue #8).
 
-### amy submodule (MUST re-apply on every amy pin bump — see PATCHES.md)
-- `amy/src/amy_midi.h` - SYSEX_COPY_SLOTS guard
-- `amy/src/amy_midi.c` - 6 guards (py/runtime.h, sysex extern, mp_sched_schedule, TUD_USB_GADGET, check_tusb_midi, mp_usbd_task)
-- `amy/src/parse.c` - 3 guards (py/runtime.h, pcm_load extern, mp_sched_schedule)
+### C Code (additive guards only)
+- `tulip/amyboard/main.c` (+20) - `mp_main_task_handle` init in `mp_task()`
+  (USB-CDC ISR wake-up; fixes a latent NULL-deref on any USB-CDC board), and one
+  `#elif defined(CYNTHIA)` arm to start `cynthia_input_task`. AMYBOARD's task
+  block unchanged, just wrapped in `#ifdef AMYBOARD`.
+- `tulip/amyboard/tasks.h` (+6) - `CYNTHIA_INPUT_TASK_*` defines + handle extern (additive).
+- `tulip/amyboard/amyboard_support.c` (+8/−) - `#ifdef AMYBOARD` around the
+  I2C-follower and `cv_read_task` (AMYboard-only hardware); no-op for others.
+- `tulip/shared/modtulip.c` (+149) - `tulip_board()` returns `"CYNTHIA"`, the
+  `ui.h` include guard, and a `#ifdef CYNTHIA` block of `cynthia_*` Python
+  bindings (with `#else` stubs for other boards). No shared behavior changed.
+- `tulip/shared/tulip_helpers.c` (+2/−) - additive `!defined(CYNTHIA)` on the `ui.h` include.
+- `tulip/shared/amy_connector.c` (+11/−10) - additive `|| defined(CYNTHIA)` on
+  6 guards, plus one `#if defined(CYNTHIA)` arm in `run_amy()` (audio_in=0,
+  UART|USB_GADGET MIDI). Removed: CYNTHIA is excluded from the USB-HOST MIDI path.
 
-### Python Code
-- `tulip/shared/py/_boot.py` - Added CYNTHIA support, auto-format partitions
-- `tulip/shared/py/tulip.py` - Skip graphics imports for CYNTHIA
-- `tulip/shared/amyboard-py/amyboard.py` - Guarded PCM9211, SD card, MIDI for CYNTHIA
+### Python (board-name guards only)
+- `tulip/shared/py/_boot.py` (+65) - CYNTHIA boot branch (headless, no
+  `init_display()`), instrument restore, registry/ADS startup. Also a generic
+  first-boot partition auto-format (helps any board, not CYNTHIA-specific).
+- `tulip/shared/py/tulip.py` (+3/−1) - skip graphics/UI imports for CYNTHIA (headless).
+- `tulip/shared/amyboard-py/amyboard.py` (+22/−) - CYNTHIA arms in `mount_sd()`
+  (no SD), `init_pcm9211()` (no PCM9211), `init_gp8413()` (no GP8413), and
+  `start_amy()` (MIDI UART skipped).
+- `tulip/amyboard/boards/manifest.py` (+1) - `package("cynthia", ...)` (additive).
+- `tulip/fs_create.py` (+72/−1) - CYNTHIA-gated 1200bps-touch flashing helper
+  plus a generic `flash-notouch` mode. Runtime-gated: `if MICROPY_BOARD == 'CYNTHIA'`.
+
+### amy submodule (3 files, 10 additive guard sites — see PATCHES.md)
+Must be re-applied on every amy pin bump; the goal is to upstream them so the
+diff becomes zero (then pin bumps are lossless automatically):
+- `amy/src/amy_midi.h` - 1 guard (`SYSEX_COPY_SLOTS`)
+- `amy/src/amy_midi.c` - 6 guards (`py/runtime.h`, sysex extern, `mp_sched_schedule`,
+  `TUD_USB_GADGET`, `check_tusb_midi`, `mp_usbd_task`)
+- `amy/src/parse.c` - 3 guards (`py/runtime.h`, pcm_load extern, `mp_sched_schedule`)
+
+### Removed during cleanup (2026-10-12)
+- `tulip/esp32s3/usb.c` — reverted entirely; was **pure debug `fprintf` scaffolding**.
+- Debug `fprintf` traces in `main.c`, `amy_connector.c`, `_boot.py` (~95 lines).
+- `MICROPY_PY_TINYUSB=1` in the shared cmake — referenced by **nothing** (dead).
+- `tulip_midi_local()` buffer-protocol widening in `modtulip.c` — reverted to
+  upstream; `cynthia/midi.py` now snapshots its `bytearray` to cached `bytes`
+  instead (preserves zero-alloc, keeps the shared function untouched).
+
 
 ## Build Command
 

@@ -18,6 +18,11 @@ import tulip
 
 # Pre-allocated 3-byte buffer: zero allocation in the hot path (§8 T1).
 _buf = bytearray(3)
+# Last-emitted message tuple, so repeated identical sends (the joystick path
+# runs ~96Hz) allocate nothing at all. tulip.midi_local() only accepts bytes
+# (upstream API), so we snapshot lazily and cache on change.
+_last_msg = None
+_last_bytes = None
 
 # Keyboard defaults (§6)
 _channel = 0        # MIDI channel index (0 = ch 1)
@@ -61,10 +66,24 @@ def octave_shift(o=None):
     return _octave_shift
 
 
-def inject(data):
-    """Feed raw MIDI bytes through AMY's real parser (same path as external
-    MIDI). Accepts bytes/bytearray or a list of ints."""
-    tulip.midi_local(data)
+def inject(data=None, n=None):
+    """Inject the message in _buf (when data is None) or `data`.
+
+    tulip.midi_local() accepts only `bytes` (upstream API), so _buf is
+    snapshotted to bytes lazily. The snapshot is cached on the message
+    value: repeated identical sends — the joystick path calls this at
+    ~96Hz for pitch bend and mod wheel — allocate nothing at all.
+    """
+    global _last_msg, _last_bytes
+    if data is None:
+        msg = (_buf[0], _buf[1], _buf[2]) if n is None else tuple(_buf[:n])
+        if msg == _last_msg:
+            return
+        _last_msg = msg
+        _last_bytes = bytes(msg)
+        tulip.midi_local(_last_bytes)
+    else:
+        tulip.midi_local(data)
 
 
 def note_on(key, vel=None, ch=None):
@@ -81,7 +100,7 @@ def note_on(key, vel=None, ch=None):
     _buf[0] = 0x90 | (ch & 0x0F)
     _buf[1] = note
     _buf[2] = vel & 0x7F
-    inject(_buf)
+    inject()
 
 
 def note_off(key, ch=None):
@@ -95,7 +114,7 @@ def note_off(key, ch=None):
     _buf[0] = 0x80 | (ch & 0x0F)
     _buf[1] = note
     _buf[2] = 0
-    inject(_buf)
+    inject()
 
 
 def all_notes_off(ch=None):
@@ -105,7 +124,7 @@ def all_notes_off(ch=None):
     _buf[0] = 0xB0 | (ch & 0x0F)
     _buf[1] = 123
     _buf[2] = 0
-    inject(_buf)
+    inject()
 
 
 def pitch_bend(value, ch=None):
@@ -118,7 +137,7 @@ def pitch_bend(value, ch=None):
     _buf[0] = 0xE0 | (ch & 0x0F)
     _buf[1] = v & 0x7F
     _buf[2] = (v >> 7) & 0x7F
-    inject(_buf)
+    inject()
 
 
 def cc(controller, value, ch=None):
@@ -128,7 +147,7 @@ def cc(controller, value, ch=None):
     _buf[0] = 0xB0 | (ch & 0x0F)
     _buf[1] = controller & 0x7F
     _buf[2] = max(0, min(127, int(value)))
-    inject(_buf)
+    inject()
 
 
 def program_change(program, ch=None):
@@ -139,4 +158,4 @@ def program_change(program, ch=None):
     _buf[0] = 0xC0 | (ch & 0x0F)
     _buf[1] = program & 0x7F
     _buf[2] = 0
-    inject(_buf[:2])
+    inject(n=2)

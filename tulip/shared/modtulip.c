@@ -306,11 +306,9 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_midi_out_obj, 1, 1, tulip_midi_
 
 // Send a message on the "local bus", as if it was received from physical midi in
 STATIC mp_obj_t tulip_midi_local(size_t n_args, const mp_obj_t *args) {
-    // Accept anything supporting the read buffer protocol (bytes, bytearray,
-    // memoryview) so callers can reuse a pre-allocated buffer with no per-note
-    // allocation. Fall back to treating the arg as an array of ints.
-    mp_buffer_info_t bufinfo;
-    if(mp_get_buffer(args[0], &bufinfo, MP_BUFFER_READ)) {
+    if(mp_obj_get_type(args[0]) == &mp_type_bytes) {
+        mp_buffer_info_t bufinfo;
+        mp_get_buffer(args[0], &bufinfo, MP_BUFFER_READ);
         midi_local((uint8_t*)bufinfo.buf, bufinfo.len);
     } else {
         mp_obj_t *items;

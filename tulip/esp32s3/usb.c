@@ -24,7 +24,6 @@
  * THE SOFTWARE.
  */
 
-#include <stdio.h>
 #include "py/runtime.h"
 #include "py/mphal.h"
 #include "usb.h"
@@ -62,20 +61,15 @@ static usb_phy_handle_t phy_hdl;
 void usb_init(void) {
     // ref: https://github.com/espressif/esp-usb/blob/4b6a798d0bed444fff48147c8dcdbbd038e92892/device/esp_tinyusb/tinyusb.c
 
-    fprintf(stderr, "usb_init: start\n"); fflush(stderr);
-
     // Configure USB PHY
     #if CONFIG_IDF_TARGET_ESP32S3
-    fprintf(stderr, "usb_init: ESP32S3 manual PHY setup\n"); fflush(stderr);
     // Manually route the DP/DM pads to the internal OTG PHY (see note above).
     // We deliberately bypass usb_new_phy() here, so phy_hdl stays NULL on S3 --
     // usb_usj_mode() below is written to tolerate that.
     (void)phy_hdl;
-    fprintf(stderr, "usb_init: periph_module_reset\n"); fflush(stderr);
     periph_module_reset(PERIPH_USB_MODULE);
     periph_module_enable(PERIPH_USB_MODULE);
 
-    fprintf(stderr, "usb_init: USB_WRAP config\n"); fflush(stderr);
     USB_WRAP.otg_conf.pad_enable = 1;
     // USB_OTG uses the internal PHY
     USB_WRAP.otg_conf.phy_sel = 0;
@@ -84,7 +78,6 @@ void usb_init(void) {
     // sw_usb_phy_sel = 1 -> USB_OTG connected to the internal PHY
     RTCCNTL.usb_conf.sw_usb_phy_sel = 1;
 
-    fprintf(stderr, "usb_init: gpio_set_drive_capability\n"); fflush(stderr);
     gpio_set_drive_capability(USBPHY_DM_NUM, GPIO_DRIVE_CAP_3);
     gpio_set_drive_capability(USBPHY_DP_NUM, GPIO_DRIVE_CAP_3);
 
@@ -95,9 +88,7 @@ void usb_init(void) {
     // disconnect and re-enumerate the new device instead of keeping the JTAG one.
     // Confirmed via USBView (#952) that a bare USB3 root port otherwise stays on
     // 303a:1001 forever and never sees AMYboard's MIDI device.
-    fprintf(stderr, "usb_init: 250ms delay\n"); fflush(stderr);
     esp_rom_delay_us(250 * 1000);  // 250 ms disconnect window
-    fprintf(stderr, "usb_init: delay done\n"); fflush(stderr);
     #else
     usb_phy_config_t phy_conf = {
         .controller = USB_PHY_CTRL_OTG,
@@ -110,10 +101,9 @@ void usb_init(void) {
     usb_new_phy(&phy_conf, &phy_hdl);
     #endif
 
-    fprintf(stderr, "usb_init: calling mp_usbd_init\n"); fflush(stderr);
     // Init MicroPython / TinyUSB
     mp_usbd_init();
-    fprintf(stderr, "usb_init: mp_usbd_init done\n"); fflush(stderr);
+
 }
 
 void mp_usbd_port_get_serial_number(char *serial_buf) {

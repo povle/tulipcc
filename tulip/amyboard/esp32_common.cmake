@@ -99,7 +99,6 @@ if(MICROPY_PY_TINYUSB)
     string(TOUPPER OPT_MCU_${IDF_TARGET} tusb_mcu)
 
     list(APPEND MICROPY_DEF_TINYUSB
-        MICROPY_PY_TINYUSB=1
         CFG_TUSB_MCU=${tusb_mcu}
     )
 

@@ -1,11 +1,8 @@
 import gc
 import uos
-print("_boot: importing modules...")
 import tulip, sys, midi, synth, amy, world, sequencer
-print("_boot: modules imported")
 from upysh import *
 from tulip import board
-print("_boot: board =", board())
 
 if board()!="AMYBOARD" and board()!="AMYBOARD_WEB" and board()!="AMYBOARD_VCV" and board()!="CYNTHIA":
     from tulip import edit, run
@@ -15,9 +12,7 @@ else:
         amyboard.mount_sd()
         edit = amyboard.edit
     elif board()=="CYNTHIA":
-        print("_boot: importing amyboard...")
         import amyboard
-        print("_boot: amyboard imported")
     elif board()=="AMYBOARD_VCV":
         import amyboard
 
@@ -33,13 +28,10 @@ else:
 
 
 try:
-    print("_boot: importing Partition...")
     from esp32 import Partition
-    print("_boot: finding partitions...")
     try:
         s = Partition.find(Partition.TYPE_DATA, label="system")[0]
         u = Partition.find(Partition.TYPE_DATA, label="vfs")[0]
-        print("_boot: partitions found")
         try:
             uos.mount(s,"/sys")
         except OSError:
@@ -56,7 +48,6 @@ try:
             uos.mount(u,"/user")
         cd('/user')
         sys.path.append("/sys/ex")
-        print("_boot: partitions mounted")
         
     except Exception as e:
         print("_boot: partition error:", e)
@@ -170,9 +161,7 @@ if board() == "AMYBOARD" or board()=="AMYBOARD_WEB" or board()=="AMYBOARD_VCV":
 
 if board() == "CYNTHIA":
     import amyboard
-    print("_boot: CYNTHIA ensure_user_environment...")
     amyboard.ensure_user_environment()
-    print("_boot: CYNTHIA ensure_user_environment done")
     # CYNTHIA is headless - skip init_display()
     # CYNTHIA boot flow (§17): restore the last-selected instrument's
     # sketch.py into /user/current/ BEFORE start_amy() runs it. The
@@ -199,9 +188,7 @@ if board() == "AMYBOARD_VCV":
     amyboard.start_amy()
 
 if board() == "CYNTHIA":
-    print("_boot: CYNTHIA start_amy...")
     amyboard.start_amy()
-    print("_boot: CYNTHIA start_amy done")
     # Daughterboard registry + ADS manager come up after AMY is running.
     try:
         from cynthia import registry, ads, config as cynthia_config
@@ -221,13 +208,8 @@ if board() == "CYNTHIA":
 
 # We don't do most of Tulip's MIDI, but setup the MIDI callback hook so midi.add_callback(fn) will work.
 if board() == "AMYBOARD" or board() == "AMYBOARD_WEB" or board() == "AMYBOARD_VCV" or board() == "CYNTHIA":
-    print("_boot: setting up MIDI callback...")
     tulip.midi_callback(midi.c_fired_midi_event)
-    print("_boot: MIDI callback done")
 
 if board() != "AMYBOARD" and board() != "AMYBOARD_WEB" and board() != "AMYBOARD_VCV":
-    print("_boot: midi.setup()...")
     midi.setup() # Just mirrors the setup mostly managed by AMY for Tulip-REPL systems.
-    print("_boot: midi.setup() done")
 
-print("_boot: complete!")
