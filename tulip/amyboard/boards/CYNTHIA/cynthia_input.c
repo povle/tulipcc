@@ -1,5 +1,6 @@
 #ifdef ESP_PLATFORM
 #include "cynthia_input.h"
+#include "cynthia_wdt.h"
 #include "pins.h"
 
 #include <stdio.h>
@@ -84,16 +85,19 @@ static const key_pin_t btn_pins[4] = {
 #define DEBOUNCE_MS 20
 #define LONG_PRESS_MS 800
 
-static float s_knob_values[CYNTHIA_NUM_POTS] = {0.5f};
+// volatile: written here (core 0), read by the UI poll (core 1). Aligned
+// 32-bit float stores are atomic on ESP32, so no lock is needed — only the
+// compiler must not hoist the read.
+static volatile float s_knob_values[CYNTHIA_NUM_POTS] = {0.5f};
 static bool s_first_pot_read[CYNTHIA_NUM_POTS] = {false};
-static float s_joy_x = 0.5f;
-static float s_joy_y = 0.5f;
+static volatile float s_joy_x = 0.5f;   // cross-core (see s_knob_values)
+static volatile float s_joy_y = 0.5f;
 static bool s_first_joy_x_read = false;
 static bool s_first_joy_y_read = false;
-static bool s_joy_btn = false;
+static volatile bool s_joy_btn = false;
 static bool s_joy_btn_last = false;
 static uint32_t s_joy_debounce_time = 0;
-static uint8_t s_btn_state = 0; // bitmask of buttons currently pressed
+static volatile uint8_t s_btn_state = 0; // bitmask; cross-core
 static int8_t s_octave_shift = 0;
 static uint32_t s_task_loop_count = 0;
 static uint32_t s_ads_read_count = 0;
@@ -112,8 +116,11 @@ typedef struct {
 } btn_event_t;
 
 static btn_event_t s_evt_queue[BTN_EVT_QUEUE_SIZE];
-static uint8_t s_evt_head = 0;
-static uint8_t s_evt_tail = 0;
+// volatile: written by this task (core 0), read by MicroPython (core 1).
+// Without volatile the compiler may cache them in a register across the
+// cross-core access, so a consumer could spin on a stale value.
+static volatile uint8_t s_evt_head = 0;
+static volatile uint8_t s_evt_tail = 0;
 
 static bool s_mcp0_present = false;
 static bool s_mcp1_present = false;
@@ -456,6 +463,9 @@ static void read_joystick_axes(void) {
 void cynthia_input_task(void *pvParameters) {
     fprintf(stderr, "cynthia_input_task: starting...\n"); fflush(stderr);
     cynthia_input_init();
+    // Take ownership of the software watchdog. Done here (core 0, its own task)
+    // because the point is to survive a hung MicroPython VM on core 1.
+    cynthia_wdt_init();
     fprintf(stderr, "cynthia_input_task: init complete, entering loop (ads_present=%d, mcp0=%d, mcp1=%d)\n",
             s_ads_present, s_mcp0_present, s_mcp1_present);
     fflush(stderr);
@@ -466,6 +476,11 @@ void cynthia_input_task(void *pvParameters) {
     for (;;) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
         s_task_loop_count++;
+
+        // 0. Software watchdog: feeds come from the Python UI poll. If those
+        //    stop (hung sketch), this reboots the board. Runs first so a long
+        //    I2C scan below can't delay the recovery decision.
+        cynthia_wdt_check();
 
         // 1. Fast Key & Button Scan (100Hz)
         scan_keys_and_buttons(now_ms);

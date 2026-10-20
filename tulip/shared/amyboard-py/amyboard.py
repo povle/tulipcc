@@ -17,9 +17,29 @@ TICKS_PER_STEP = int((4.0 / 32.0) * amy.AMY_SEQUENCER_PPQ)
 # console and starve the REPL.
 _MAX_LOOP_FAILS = 8
 
+# loop() time budget. The slot is a 32nd note (~62ms at the default 120 BPM);
+# this is deliberately generous (2.5 slots) so a sketch that merely does a slow
+# render is not killed, while one that genuinely monopolises the CPU is. Counted
+# over consecutive calls, so a single slow tick is tolerated.
+_LOOP_OVERRUN_MS = 150
+_MAX_LOOP_OVERRUNS = 16
+
 # Web encoder emulation state (used when running on AMYBOARD_WEB)
 _web_encoder_pos = 0      # cumulative encoder position
 _web_encoder_button = False  # current button state
+
+# CYNTHIA has no I2C encoder accessories, but it has 16 panel pots and 4 buttons
+# + a joystick click. They are exposed as a synthetic "cynthia" device so that
+# library sketches written against the emulated encoder (web/vcv) run unmodified
+# on CYNTHIA hardware. See _detect_encoder_devices() and Encoder._cynthia_*.
+#
+# The pots are ENDLESS (absolute angle 0..1, see cynthia/drivers/spark_pots_*),
+# so a position has to be unwrapped into a cumulative counter to behave like a
+# real quadrature encoder — otherwise crossing 0/360 looks like one huge turn.
+_CYNTHIA_POT_TICKS = 4096        # counter units per full pot revolution
+# Encoder button index -> CYNTHIA button index (see cynthia_input.c: 0 octave
+# down, 1 octave up, 2 patch prev, 3 patch next, 4 joystick click).
+_CYNTHIA_BTN_MAP = (2, 3, 1, 0, 4)
 
 def web():
     return (tulip.board()=="AMYBOARD_WEB")
@@ -27,6 +47,11 @@ def web():
 def _vcv():
     # AMYboard running inside the VCV Rack plugin (see tulip/vcvrack/).
     return (tulip.board()=="AMYBOARD_VCV")
+
+def _cynthia():
+    # CYNTHIA mainboard: no encoder accessories, but its own pots/buttons are
+    # presented to sketches as one (see _detect_encoder_devices).
+    return (tulip.board()=="CYNTHIA")
 
 def cv_capable():
     """True on boards with AMYboard CV hardware. This module is also frozen
@@ -716,9 +741,11 @@ def _start_sketch_loop(loop_fn):
     _busy = False
     _started = False
     _fails = 0
+    _overruns = 0
+    _last_ms = None
 
     def _guarded_loop(tick):
-        nonlocal _busy, _started, _fails
+        nonlocal _busy, _started, _fails, _overruns, _last_ms
         if _busy:
             return
         _busy = True
@@ -727,6 +754,31 @@ def _start_sketch_loop(loop_fn):
                 if tick % ticks_per_bar:
                     return  # hold loop() until the next downbeat
                 _started = True
+
+            # Time budget. _MAX_LOOP_FAILS only counts *raising* loops; a loop
+            # that consistently overruns its slot (or hangs, until the task
+            # watchdog resets the board) never raises at all, so it has to be
+            # caught by measuring. Without this the symptom is silent: input and
+            # UI starve while audio (rendered on the other core) keeps playing.
+            now_ms = time.ticks_ms()
+            if _last_ms is not None:
+                gap = time.ticks_diff(now_ms, _last_ms)
+                # A slot is 1/32 note; at the default 120 BPM that is ~62ms.
+                # Anything past _LOOP_OVERRUN_MS means the previous loop() ate
+                # its whole budget and then some.
+                if gap > _LOOP_OVERRUN_MS:
+                    _overruns += 1
+                    if _overruns == _MAX_LOOP_OVERRUNS:
+                        print("sketch.loop() overran its slot %d times in a row "
+                              "(%dms of a %dms budget) -- stopping the sketch "
+                              "loop so the board stays responsive."
+                              % (_overruns, gap, _LOOP_OVERRUN_MS))
+                        stop_sketch()
+                        return
+                else:
+                    _overruns = 0
+            _last_ms = now_ms
+
             loop_fn(tick)
             _fails = 0
         except Exception as e:
@@ -1368,6 +1420,13 @@ def _detect_encoder_devices(exclude=()):
         return [("web", None)]
     if _vcv():
         return [("vcv", None)]
+    if _cynthia():
+        # CYNTHIA's own pots/buttons stand in for an encoder accessory (below).
+        # Only advertise it when the input bindings actually exist, so a board
+        # without them still reports "no encoders" rather than a dead facade.
+        if hasattr(tulip, "cynthia_knobs"):
+            return [("cynthia", None)]
+        return []
     try:
         present = set(get_i2c().scan())
     except Exception:
@@ -1432,7 +1491,7 @@ class Encoder:
             if addr is not None:
                 # Bind only the device at this address.
                 found = [(t, a) for (t, a) in found if a == addr]
-        elif type in ("web", "vcv"):
+        elif type in ("web", "vcv", "cynthia"):
             found = [(type, None)]
         elif type in _ENCODER_PROFILES:
             # Forced type: trust the caller, don't require detection (matches
@@ -1447,6 +1506,14 @@ class Encoder:
             if t in ("web", "vcv"):
                 d = {"type": t, "addr": None, "n": 1, "leds": 0, "buttons": 1,
                      "seesaw": False}
+            elif t == "cynthia":
+                # CYNTHIA's own panel: one "encoder" per pot, plus its buttons.
+                # Pots are endless so they carry absolute angle, unwrapped into a
+                # cumulative counter below; buttons are level-read (no seesaw).
+                n = len(tulip.cynthia_knobs())
+                d = {"type": t, "addr": None, "n": n, "leds": 0,
+                     "buttons": len(_CYNTHIA_BTN_MAP), "seesaw": False,
+                     "angle": [None] * n, "turns": [0] * n}
             else:
                 p = _ENCODER_PROFILES[t]
                 d = {"type": t, "addr": a, "n": p["encoders"], "leds": p["leds"],
@@ -1497,6 +1564,24 @@ class Encoder:
             return _web_encoder_pos
         if t == "vcv":
             return tulip.vcv_encoder(j)
+        if t == "cynthia":
+            try:
+                ang = float(tulip.cynthia_knobs()[j])
+            except Exception:
+                return d["turns"][j] * _CYNTHIA_POT_TICKS
+            # Unwrap the 0..1 absolute angle into a cumulative turn counter, so
+            # a real endless pot behaves like a quadrature encoder: crossing the
+            # 0/1 seam must not read as a full revolution in one sample.
+            prev = d["angle"][j]
+            if prev is not None:
+                delta = ang - prev
+                if delta > 0.5:
+                    delta -= 1.0        # wrapped backwards past 0/1
+                elif delta < -0.5:
+                    delta += 1.0        # wrapped forwards past 1/0
+                d["turns"][j] += delta
+            d["angle"][j] = ang
+            return int(round(d["turns"][j] * _CYNTHIA_POT_TICKS))
         if d["seesaw"]:
             return read_encoder(j, seesaw_dev=d["addr"])
         if t == "m5stack":
@@ -1540,6 +1625,16 @@ class Encoder:
             return _web_encoder_button
         if t == "vcv":
             return tulip.vcv_encoder_button(j)
+        if t == "cynthia":
+            # CYNTHIA reports buttons as a bitmask (see tulip_cynthia_buttons).
+            # Level-read, so poll_button_events()' hold counting still works.
+            try:
+                bit = _CYNTHIA_BTN_MAP[j] if j < len(_CYNTHIA_BTN_MAP) else None
+                if bit is None:
+                    return False
+                return bool(tulip.cynthia_buttons() & (1 << bit))
+            except Exception:
+                return False
         if d["seesaw"]:
             return read_buttons(pins=(d["button_pins"][j],), seesaw_dev=d["addr"])[0]
         if t == "m5stack":

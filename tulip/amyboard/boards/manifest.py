@@ -16,6 +16,10 @@ require("webrepl")  # WebREPL server (REPL over WiFi); _webrepl C module is enab
 require("dht")
 require("ds18x20")
 require("onewire")
+# NOTE: no aioble. cynthia/ble_midi.py talks to the raw `bluetooth` module:
+# aioble is asyncio-based and nothing runs an event loop on CYNTHIA, so an
+# aioble advertising task was scheduled and never executed (the radio stayed
+# silent while the UI said "Advertising").
 require("umqtt.robust")
 require("umqtt.simple")
 

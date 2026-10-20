@@ -17,7 +17,6 @@ from . import registry, ads
 # Pot values must move more than this (0..1) before they count as changed.
 KNOB_EPSILON = 0.004
 
-_drivers = {}
 _main = None          # driver providing joystick/display (spark_main)
 _pot = None           # driver providing knobs()
 _display = None
@@ -33,10 +32,10 @@ def start():
     """
     global _main, _pot, _display, _values, _last, _started
     registry.start()
-    _drivers = registry.drivers()
+    drivers = registry.drivers()
     _main = None
     _pot = None
-    for drv in _drivers.values():
+    for drv in drivers.values():
         if hasattr(drv, "joystick") and hasattr(drv, "display"):
             _main = drv
         if hasattr(drv, "knobs"):
@@ -89,9 +88,14 @@ def poll(now_ms=None):
 
 
 def knobs():
-    """All pot positions 0..1 (cached)."""
-    if hasattr(tulip, "cynthia_knobs"):
-        return list(tulip.cynthia_knobs())
+    """All pot positions 0..1, from the cache filled by poll().
+
+    Deliberately does NOT call tulip.cynthia_knobs() again: poll() already
+    refreshed `_values` this tick, and re-calling meant a second C call plus a
+    fresh 16-element list *every poll* (~60 redundant calls and ~60 list
+    allocations per second at 30Hz) — pure GC churn on a device where GC pauses
+    are audible. `_values` is the single source of truth between polls.
+    """
     return _values
 
 
@@ -99,12 +103,18 @@ def knob_changes(epsilon=KNOB_EPSILON):
     """[(index, value)] for pots that moved more than epsilon since the last
     call. Used by the runtime to route only real movements to the sketch.
     First call or after init aligns _last to curr so no false changes fire."""
-    curr = knobs()
+    curr = _values
     changed = []
     global _last
     if len(_last) < len(curr):
-        # Init new slots to curr value so initial position doesn't trigger
-        _last = list(curr) if len(_last) <= 0 else _last + [0.0] * (len(curr) - len(_last))
+        # New slots must START at their current value, or every added pot reports
+        # a huge spurious change (a pot sitting at 0.8 would read as +0.8) and
+        # jerks whatever patch parameter it is mapped to. Pad from `curr`, not
+        # from 0.0 — the earlier code padded with zeros and had exactly that bug.
+        if not _last:
+            _last = list(curr)
+        else:
+            _last = list(_last) + list(curr[len(_last):])
     for i in range(len(curr)):
         v = curr[i]
         d = v - _last[i]
@@ -121,7 +131,16 @@ def sync_knobs(values):
     virtual positions, when the driver supports them) with a patch's values
     so loading an instrument doesn't jump."""
     global _values, _last
-    n = min(len(values), len(_values)) if _values else len(values)
+    if not values:
+        return
+    # Grow _values / _last to hold `values` first: they can legitimately be
+    # shorter (before the first poll filled them, or when a driver reports fewer
+    # pots), and the previous version indexed blindly and raised IndexError.
+    if len(_values) < len(values):
+        _values = list(_values) + [0.0] * (len(values) - len(_values))
+    if len(_last) < len(values):
+        _last = list(_last) + list(values[len(_last):])
+    n = min(len(values), len(_values))
     for i in range(n):
         _values[i] = values[i]
         _last[i] = values[i]
@@ -330,10 +349,20 @@ def joystick():
             dz = 0.03
             if abs(v - center) < dz:
                 return 0.5
+            # Guard the divisor: a saved calibration with min==center (a botched
+            # sweep, or an old file) would divide by zero inside the poll, which
+            # kills every later poll and freezes the whole UI. Floor the span at
+            # 5% of full scale instead.
+            lo_span = center - lo
+            hi_span = hi - center
+            if lo_span < 0.05:
+                lo_span = 0.05
+            if hi_span < 0.05:
+                hi_span = 0.05
             if v < center:
-                return 0.5 - 0.5 * (center - v) / (center - lo)
+                return 0.5 - 0.5 * (center - v) / lo_span
             else:
-                return 0.5 + 0.5 * (v - center) / (hi - center)
+                return 0.5 + 0.5 * (v - center) / hi_span
 
         jx = max(0.0, min(1.0, _cal(jx, cx, lo_x, hi_x)))
         jy = max(0.0, min(1.0, _cal(jy, cy, lo_y, hi_y)))

@@ -1,3 +1,4 @@
+
 # cynthia/display.py
 # SH1106 128x64 OLED driver for the CYNTHIA mainboard.
 # The display sits on I2C bus 0 (same bus as ADS1115), address 0x3C.
@@ -8,7 +9,7 @@
 
 import framebuf
 from machine import I2C, Pin
-from . import pins
+from . import pins, i18n
 
 import tulip
 
@@ -20,6 +21,11 @@ FONT_TENFATGUYS = 3     # u8g2_font_tenfatguys_tf (patch names, bold titles)
 FONT_TENTHINNERGUYS = 4 # u8g2_font_tenthinnerguys_tf (instrument grid menu labels)
 FONT_RESOLEDBOLD = 5    # u8g2_font_resoledbold_tr (synth name in status bar header)
 FONT_SPLEEN12X24 = 6    # u8g2_font_spleen12x24_mu (large readout numbers)
+# Bold face WITH Cyrillic, used only when text is non-ASCII: the faces above are
+# ASCII-only (spleen/ten*guys/resoled have no Cyrillic build upstream). Kept as a
+# fallback rather than a replacement so the original look is preserved for
+# English and for all instrument/patch content.
+FONT_6X13B = 7           # u8g2_font_6x13B_t_cyrillic (Cyrillic fallback)
 # SH1106 I2C address (0x3C or 0x3D)
 SH1106_ADDR = 0x3C
 
@@ -167,11 +173,19 @@ class SH1106:
         oct_str = "OCT:%+d" % octave
         self.draw_str(FONT_5X7, 2, 7, oct_str, 1)
 
-        # Center: Instrument Name in resoledbold_tr
+        # Center: Instrument Name. resoledbold_tr is ASCII-only (its glyph table
+        # cannot be swapped for a Cyrillic one - no such face exists upstream),
+        # so a Cyrillic name would render as nothing at all. Fall back to the
+        # bold Cyrillic face for any non-ASCII text instead of showing a blank.
         name_str = str(inst_name)
-        text_w = self.str_width(FONT_RESOLEDBOLD, name_str)
+        if i18n.is_cyrillic(name_str):
+            name_str = self.fit_text(FONT_6X13B, name_str, 124)
+            name_font = FONT_6X13B
+        else:
+            name_font = FONT_RESOLEDBOLD
+        text_w = self.str_width(name_font, name_str)
         start_x = max(0, (WIDTH - text_w) // 2)
-        self.draw_str(FONT_RESOLEDBOLD, start_x, 7, name_str, 1)
+        self.draw_str(name_font, start_x, 7, name_str, 1)
 
         # Right: joystick position (temp) or battery
         if joystick_xy is not None:
@@ -191,29 +205,104 @@ class SH1106:
         # Horizontal divider line at y=10
         self.hline(0, 10, WIDTH, 1)
 
-    def draw_instrument_grid(self, instruments, cursor_row=0, cursor_col=0):
-        """Draw 2x3 grid instrument browser menu matching original Cynthia C++ firmware.
-        Cells: 42x23, starting at MENU_Y=12. Active cell inverted box.
+    def draw_app_bar(self, label, selected=False):
+        """Full-width Settings bar under the instrument grid.
+
+        Settings is a peer of the instruments, so it has to LOOK selectable: a
+        bordered box spanning the panel, using the same face as the instrument
+        cells, inverted when the cursor is on it.
+        """
+        y = 53
+        h = 11
+        if selected:
+            self.fill_rect(0, y, WIDTH, h, 1)
+            col = 0
+        else:
+            self.rect(0, y, WIDTH, h, 1)
+            col = 1
+        font = self._grid_font(label, WIDTH - 6)
+        txt = self.fit_text(font, label, WIDTH - 6)
+        w = self.str_width(font, txt)
+        # Measured glyph extents: tenthinnerguys spans baseline-9..baseline-1,
+        # 4x6 spans baseline-5..baseline-1. Baseline y+h-1 therefore puts the
+        # tenthinnerguys label at 54..62 inside an 11px band bordered at 53 and
+        # 63 — one clear pixel above and below.
+        self.draw_str(font, max(0, (WIDTH - w) // 2), y + h - 1, txt, col)
+
+    def fit_text(self, font, text, max_w, ellipsis="~"):
+        """Trim `text` to fit `max_w` px, marking the cut with one character.
+
+        A single '~' rather than '..': the grid font (tenthinnerguys) is wide
+        enough that two extra glyphs cost ~12px, which is a whole character out
+        of the ~6 that fit a 42px cell. One marker buys back a letter and reads
+        the same to a user ("a name was shortened").
+        """
+        if not text:
+            return ""
+        if self.str_width(font, text) <= max_w:
+            return text
+        lo = 0
+        for n in range(len(text) - 1, 0, -1):
+            if self.str_width(font, text[:n] + ellipsis) <= max_w:
+                lo = n
+                break
+        return (text[:lo] + ellipsis) if lo else ""
+
+    def _grid_font(self, text, max_w):
+        """Largest font that can render `text` within `max_w`.
+
+        FONT_TENTHINNERGUYS is ~10px tall (the original C++ grid face) and is
+        the right choice for short names like "juno"/"DX7"; it is wide and has
+        no Cyrillic, so fall back to FONT_4X6 (smaller, but fits more and
+        carries Cyrillic) when the text is Cyrillic or does not fit.
+        """
+        if not i18n.is_cyrillic(text) and \
+                self.str_width(FONT_TENTHINNERGUYS, text) <= max_w:
+            return FONT_TENTHINNERGUYS
+        return FONT_4X6
+
+    def draw_instrument_grid(self, instruments, cursor_row=0, cursor_col=0,
+                             rows=2, cols=3):
+        """Draw the 2x3 app grid (instruments) above the Settings bar.
+
+        Cells are 42x21 from MENU_Y=12, leaving the bottom band (y=55..63) for
+        draw_app_bar(). The active cell is drawn inverted.
         """
         cell_w = 42
-        cell_h = 23
+        cell_h = 20
         menu_y = 12
 
-        for row in range(2):
-            for col in range(3):
-                idx = row * 3 + col
+        for row in range(rows):
+            for col in range(cols):
+                idx = row * cols + col
                 x = col * cell_w
                 y = menu_y + row * cell_h
                 is_cursor = (row == cursor_row and col == cursor_col)
 
-                name = instruments[idx] if idx < len(instruments) else "---"
-                text_w = self.str_width(FONT_TENTHINNERGUYS, name)
+                name = instruments[idx] if idx < len(instruments) else ""
+                if isinstance(name, tuple):
+                    label, slug = name
+                    # Friendly label when it fits, else the compact slug.
+                    font = self._grid_font(label, cell_w - 4)
+                    if self.str_width(font, label) <= cell_w - 4:
+                        name = label
+                    else:
+                        font = self._grid_font(slug, cell_w - 4)
+                        name = slug
+                else:
+                    font = self._grid_font(name, cell_w - 4)
+
+                name = self.fit_text(font, name, cell_w - 4)
+                text_w = self.str_width(font, name)
                 text_x = x + (cell_w - text_w) // 2
-                text_y = y + (cell_h + 9) // 2
+                # Baselines chosen from measured glyph extents so each face is
+                # centred in a 20px cell: tenthinnerguys occupies
+                # baseline-9..baseline-1, 4x6 baseline-5..baseline-1.
+                text_y = y + (14 if font == FONT_TENTHINNERGUYS else 12)
 
                 if is_cursor:
                     self.fill_rect(x + 1, y + 1, cell_w - 2, cell_h - 2, 1)
-                    self.draw_str(FONT_TENTHINNERGUYS, text_x, text_y, name, 0)
+                    self.draw_str(font, text_x, text_y, name, 0)
                 else:
                     self.rect(x, y, cell_w, cell_h, 1)
-                    self.draw_str(FONT_TENTHINNERGUYS, text_x, text_y, name, 1)
+                    self.draw_str(font, text_x, text_y, name, 1)

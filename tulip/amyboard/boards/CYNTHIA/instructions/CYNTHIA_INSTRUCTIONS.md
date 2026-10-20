@@ -83,9 +83,12 @@ OUTPUT
 │ MODE MANAGER (Python) — BROWSER <-> PLAY <-> MENU, routes     │
 ├──────────────────────────────────────────────────────────────┤
 │ APP: instrument_browser.py (list/select/run sketches)         │
+│      + SETTINGS app on menu row 2 (§13.1)                     │
 │ STATE: per-instrument state.json (knobs/params/patch) (§17)   │
+│        global settings.json (locale/MIDI/BLE) (§13)           │
 ├──────────────────────────────────────────────────────────────┤
-│ ROUTING: cynthia/midi.py (MIDI event bus/injection)           │
+│ ROUTING: cynthia/midi.py (MIDI event bus/injection + taps)    │
+│          cynthia/ble_midi.py (BLE-MIDI peripheral, §13.3)     │
 │          cynthia/surface.py (knobs/touch/buttons/UI events)   │
 │          cynthia/params.py (§11) · cynthia/patch.py (§12)     │
 │          cynthia/registry.py + cynthia/config.py              │
@@ -377,11 +380,17 @@ Hardware:
 | ---------- | ---------------------------------------------------- | ------------------------------- |
 | Octave−    | keyboard octave down (firmware note-offset, clamped) | (reserved/free)                 |
 | Octave+    | keyboard octave up                                   | (reserved/free)                 |
-| Patch prev | previous patch (§12)                                 | (reserved)                      |
+| Patch prev | previous patch (§12)                                 | **open save-patch menu**         |
 | Patch next | next patch (§12)                                     | **open patch menu (MENU mode)** |
 
+The instrument browser is entered by a **long press on the joystick button** (§7); inside it,
+the menu is 2 rows x 3 cols of instruments plus a **Settings bar as row 2** (§13.1). Joystick
+Y picks the row (top third / middle / bottom third), X moves within the row, short press
+selects, and a long press always returns to PLAY.
+
 Octave shift is a firmware-level note offset applied to the keyboard's MIDI note numbers;
-transparent to sketches. Persisted in `state.json → surface.octave_shift`.
+transparent to sketches. Persisted as `octave` in `/user/settings.json` (§13.1) and re-applied
+at boot by `settings.apply_to_runtime()`.
 
 Capabilities: MIDI notes, pitch/mod, nav, `display`, octave/patch buttons.
 
@@ -524,7 +533,142 @@ without `cynthia_patches()` / `cynthia_params()`:
 
 ---
 
-## 13. (reserved)
+## 13. Settings app, i18n and BLE-MIDI
+
+Three features that all live in the same layer (the UI/app plane, not the synth):
+
+### 13.1 Settings is an app, not a hidden gesture
+
+The menu is **2 rows x 3 cols of instruments + a full-width Settings bar as row 2**
+(`runtime.SETTINGS_ROW`). One joystick walk visits instruments and Settings; a
+short press selects. Settings is *not* a slot after the last instrument: that
+encoding put it at a grid position above row 1, which made it unreachable as
+soon as there were 3+ instruments (found and fixed during implementation). A
+dedicated row is reachable at any instrument count.
+
+Layout: 2 rows x 3 cols of instruments at 42x20 px from y=12, then a
+**full-width bordered Settings bar at y=53..63**. The bar uses the same face as
+the instrument cells (FONT_TENTHINNERGUYS when the label is ASCII and fits,
+else FONT_4X6) and inverts when selected — it has to look selectable, not like a
+caption. Instrument cells prefer FONT_TENTHINNERGUYS for short names and fall
+back to FONT_4X6 only for long or Cyrillic labels.
+
+Rows: Language, MIDI channel, Velocity, Octave, BLE MIDI (toggle), BLE Name,
+BLE Status (read-only), Joystick calibration (action), Back. Joystick vertical = move row, horizontal = change
+value, short press = toggle/enter, long press = back to PLAY (universal back).
+Storage is `/user/settings.json` (`cynthia/settings.py`), written
+tmp-file-then-rename so a power cut cannot leave an empty config; every read
+falls back to the documented default, so a corrupt file never blocks boot.
+Hardware wiring stays in `daughterboard.json` — different file, different
+concern, so one bad file cannot take out the other.
+
+**Joystick calibration** is reachable two ways: the `calibrate` row in Settings,
+or **holding Octave- and Octave+ together for 5 seconds** anywhere in PLAY (a
+held-button chord, detected from `cynthia_get_buttons()` because button *events*
+only report short/long presses and have no chord). While held, the panel shows a
+progress bar. The routine itself: hold-still centre sample → sweep sample with a
+progress bar → save → a live dot-in-a-box test screen that exits on a click or
+after 6s. It disarms the watchdog while blocking and re-arms in a `finally`, so
+an aborted calibration cannot leave the poll stopped.
+
+### 13.2 i18n (en, ru) — chrome only
+
+`cynthia/i18n.py` holds a flat key -> string table for `en` and `ru`. Translate
+**chrome only**: headers, menu/menu titles, buttons, settings labels, knob
+parameter names, prompts. **Never** translate instrument names (from `meta.json`)
+or patch names (user-typed) — those are content, and a Russian user who names a
+patch "Bass" should still see "Bass".
+
+Cyrillic rendering needed two things:
+
+1. **Font data.** The U8G2 `_tr` faces are ASCII-only, so `cynthia_fonts.h` now
+   carries the Cyrillic builds of the three text faces (`5x7`, `4x6`, `7x13` —
+   same family, superset glyph coverage, +5.4 KB flash). The custom faces
+   (`tenfatguys`, `tenthinnerguys`, `resoledbold`) and `spleen` have **no
+   Cyrillic build upstream**, so `CYNTHIA_FONT_6X13B` was added as an explicit
+   Cyrillic-capable bold fallback for any non-ASCII string (header instrument
+   name, etc.). `display.draw_header` selects it automatically via
+   `i18n.is_cyrillic`.
+2. **UTF-8 decoding in C.** `cynthia_ui_draw_str` / `cynthia_ui_str_width` used
+   to walk bytes, which fed each Cyrillic character to the glyph lookup as two
+   unrelated codepoints (blank or garbage). Both now decode UTF-8 first
+   (`utf8_next`, tolerant of truncated input).
+
+**Latent bug found while doing this:** the Unicode branch of
+`font_get_glyph_data` never reset its search pointer to
+`font+23+start_pos_unicode` (u8g2's reference does), and advanced by a size byte
+that could be 0 — an infinite loop. It was unreachable while every font was
+ASCII-only; the Cyrillic faces make it live. Fixed to match u8g2.
+
+### 13.3 BLE-MIDI (port of the original `InstrumentBLE.cpp`)
+
+`cynthia/ble_midi.py` advertises the standard BLE-MIDI service
+(`03b80e5a-…`, char `7772e5db-…`) so a phone/iPad/DAW sees CYNTHIA as a MIDI
+device.
+
+The radio half maps 1:1 to the Arduino version; the **routing** half deliberately
+differs. The C++ instrument hard-coded a CC number per pot. Here the firmware
+already has one MIDI bus (§6), so BLE taps it in both directions:
+
+```
+internal controls --inject()--> AMY (as always)
+                          \--> forwarder --> BLE notify --> host
+host write --> parse --> tulip.midi_local() --> AMY
+```
+
+`cynthia/midi.py` gained `add_forwarder/remove_forwarder` for that tap.
+
+**Two build-system gates, both of which silently disabled BLE.** If BLE ever
+stops working after a submodule bump, check these first:
+
+1. `tulip/amyboard/mpconfigport.h` defines `MICROPY_PY_BLUETOOTH (0)` for every
+   Tulip board — so `CONFIG_BT_ENABLED=y` alone compiled the IDF stack but never
+   MicroPython's `bluetooth` module (`nm micropython.elf | grep nimble_port_init`
+   was empty). CYNTHIA now sets `MICROPY_BOARD_WANTS_BLUETOOTH` in
+   `mpconfigboard.h` and the define is guarded by it.
+   **This header is COPIED over `micropython/ports/esp32/mpconfigport.h` by
+   `amyboard/CMakeLists.txt` on every build** — editing the submodule copy does
+   nothing.
+2. MicroPython's NimBLE bonding code predates IDF 5.4 (`ble_store_key_sec.ediv_rand_present`
+   was renamed), so pairing/bonding and central mode are compiled out for CYNTHIA
+   in the same header. BLE-MIDI needs neither.
+
+**No aioble.** It is asyncio-based, and nothing runs an event loop on CYNTHIA
+(the UI is an AMY TulipSequence callback), so `uasyncio.create_task()` from
+`_boot.py` scheduled an advertising coroutine that never executed — the status
+showed "Advertising" while the radio was silent. The module uses the raw
+`bluetooth` API (`gap_advertise` + an IRQ handler), which needs no loop and
+mirrors the C++ `BLEDevice`/`BLEServer` callbacks.
+
+Advertisement is built by hand (`_adv_payloads`): flags, then the 128-bit service
+UUID **complete** (iOS filters scan results by service), then the device name in
+the scan response. 21 + 9 bytes, both under the 31-byte limit. The UUID bytes are
+produced by `_uuid_bytes` rather than `bytes(bluetooth.UUID(...))` so the payload
+does not depend on the UUID object supporting the buffer protocol.
+
+Two correctness details worth keeping:
+
+- **Echo guard.** Incoming host MIDI is injected into the shared bus, which calls
+  every forwarder — including ours. Without `_echo_guard` every note would be
+  sent straight back to the host (doubling, or looping with a fast host).
+- **System real-time** (`0xF8`..`0xFF`) is a complete one-byte message that can
+  appear *between* the bytes of a channel message; it must be emitted and must
+  **not** become the new running status. System common (`0xF0`..`0xF7`) is
+  dropped rather than length-parsed, so a sysex cannot eat the next message.
+- Inbound writes are handed to the VM with `micropython.schedule()`, never
+  processed on the NimBLE task (same reason `cynthia_input.c` uses
+  `mp_sched_schedule`).
+
+Build configuration: `CONFIG_BT_ENABLED` + NimBLE in
+`boards/CYNTHIA/sdkconfig.board`, `bt` in `IDF_COMPONENTS`,
+`mpnimbleport.c` in the port source list, private NimBLE include dir enabled.
+NimBLE only (MicroPython's esp32 binding targets it), peripheral + broadcaster.
+`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192` — **use the `_HOST_` name**; the
+shorter `CONFIG_BT_NIMBLE_TASK_STACK_SIZE` is a renamed-legacy alias that is
+silently dropped from `sdkconfig.board`. MicroPython derives its BLE sync-event
+stack as `(that - 1024)`, giving 7168 bytes of callback stack instead of 3072.
+Cost: ~200 KB flash, 17% of the app partition still free. BLE starts at boot when
+`ble_midi_enabled` is set (default on); the settings toggle starts/stops it live.
 
 ---
 

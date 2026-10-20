@@ -25,6 +25,11 @@ _last_msg = None
 _last_bytes = None
 
 # Keyboard defaults (§6)
+# Optional taps that observe every message this bus emits (§16). Used by
+# ble_midi to mirror internal controls to a host. A list rather than a single
+# slot so a future USB-controller mode can listen too.
+_forwarders = []
+
 _channel = 0        # MIDI channel index (0 = ch 1)
 _velocity = 100     # fixed note-on velocity (no velocity sensing)
 _base_note = 48     # C3; 28 keys -> notes 48..75
@@ -66,6 +71,20 @@ def octave_shift(o=None):
     return _octave_shift
 
 
+def add_forwarder(fn):
+    """Register fn(message_tuple) to observe every emitted message."""
+    if fn not in _forwarders:
+        _forwarders.append(fn)
+
+
+def remove_forwarder(fn):
+    """Undo add_forwarder(fn). Safe if it was never added."""
+    try:
+        _forwarders.remove(fn)
+    except ValueError:
+        pass
+
+
 def inject(data=None, n=None):
     """Inject the message in _buf (when data is None) or `data`.
 
@@ -82,8 +101,24 @@ def inject(data=None, n=None):
         _last_msg = msg
         _last_bytes = bytes(msg)
         tulip.midi_local(_last_bytes)
+        # Forward AFTER local send so a slow/absent BLE link cannot delay the
+        # synth, and only for messages that actually changed (the dedupe above
+        # already filtered repeats). Zero cost when nobody registered.
+        if _forwarders:
+            for _fn in _forwarders:
+                try:
+                    _fn(msg)
+                except Exception:
+                    pass
     else:
         tulip.midi_local(data)
+        if _forwarders:
+            _t = tuple(data[:3]) if len(data) >= 3 else tuple(data)
+            for _fn in _forwarders:
+                try:
+                    _fn(_t)
+                except Exception:
+                    pass
 
 
 def note_on(key, vel=None, ch=None):
@@ -131,7 +166,10 @@ def pitch_bend(value, ch=None):
     """value -1.0..1.0 -> 14-bit pitch bend (0xE0), center = 0x2000."""
     if ch is None:
         ch = _channel
-    v = int((max(-1.0, min(1.0, value)) + 1.0) * 8191.5)
+    # +0.5 rounds instead of truncating: truncation put the neutral stick at
+    # 8191 (0x7F 0x3F) instead of the true 14-bit center 8192 (0x00 0x40), i.e.
+    # a permanent 1-LSB detune with the stick at rest.
+    v = int((max(-1.0, min(1.0, value)) + 1.0) * 8191.5 + 0.5)
     if v > 16383:
         v = 16383
     _buf[0] = 0xE0 | (ch & 0x0F)

@@ -56,13 +56,21 @@ class Slot:
         return self.gpio[letter]
 
     def spi(self, sck, mosi, miso=None, cs=None, baudrate=1000000, polarity=0, phase=0):
-        """Hardware SPI over chosen slot GPIOs (ESP32-S3 GPIO matrix, §3.1)."""
+        """Hardware SPI over chosen slot GPIOs (ESP32-S3 GPIO matrix, §3.1).
+
+        The id is derived from the slot, NOT hardcoded to 1: on ESP32-S3 flash
+        owns SPI0/1 and only SPI2/SPI3 exist for `machine.SPI`, whose ids are
+        0 and 1. Both slots asking for id 1 collided — the second start() died
+        with "SPI host already in use" (machine_hw_spi.c raises exactly that).
+        Slot 0 -> id 0 (SPI2), slot 1 -> id 1 (SPI3). Only one driver uses SPI
+        today, so this was latent, not visible.
+        """
         kwargs = dict(baudrate=baudrate, polarity=polarity, phase=phase,
                       sck=self.pin(sck, machine.Pin.OUT),
                       mosi=self.pin(mosi, machine.Pin.OUT))
         if miso is not None:
             kwargs["miso"] = self.pin(miso, machine.Pin.IN)
-        spi = machine.SPI(1, **kwargs)
+        spi = machine.SPI(self.id, **kwargs)
         if cs is not None:
             cs_pin = self.pin(cs, machine.Pin.OUT)
             cs_pin.value(1)

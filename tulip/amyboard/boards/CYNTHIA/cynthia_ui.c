@@ -23,7 +23,8 @@ static const uint8_t *s_cynthia_fonts[CYNTHIA_FONT_COUNT] = {
     u8g2_font_tenfatguys_tf,
     u8g2_font_tenthinnerguys_tf,
     u8g2_font_resoledbold_tr,
-    u8g2_font_spleen12x24_mu
+    u8g2_font_spleen12x24_mu,
+    u8g2_font_6x13B_t_cyrillic
 };
 
 const uint8_t *cynthia_ui_get_font(uint8_t font_idx) {
@@ -138,7 +139,15 @@ static const uint8_t *font_get_glyph_data(const uint8_t *font, const cynthia_fon
             p += u8x8_pgm_read(p + 1);
         }
     } else {
+        // Unicode block table: a list of (offset, last-encoding) pairs starting
+        // at font+23+start_pos_unicode, where BOTH the search cursor and the
+        // walk start from that base (u8g2_font_get_glyph_data). The previous
+        // code left p at font+23 — i.e. it walked the ASCII glyph data as if it
+        // were the block table — and then advanced p by a size byte that could
+        // read as 0, spinning forever. Unreachable while every font was
+        // ASCII-only; the Cyrillic faces make this path live.
         const uint8_t *table = font + 23 + info->start_pos_unicode;
+        p = table;
         uint16_t e;
         do {
             p += font_get_word(table, 0);
@@ -152,7 +161,9 @@ static const uint8_t *font_get_glyph_data(const uint8_t *font, const cynthia_fon
             if (e == encoding) {
                 return p + 3;
             }
-            p += u8x8_pgm_read(p + 2);
+            uint8_t step = u8x8_pgm_read(p + 2);
+            if (step == 0) break;   // malformed table: never spin on 0 stride
+            p += step;
         }
     }
     return NULL;
@@ -163,6 +174,45 @@ static void font_setup_decode(cynthia_font_decode_t *decode, const cynthia_font_
     decode->decode_bit_pos = 0;
     decode->glyph_width = font_decode_get_unsigned_bits(decode, info->bits_per_char_width);
     decode->glyph_height = font_decode_get_unsigned_bits(decode, info->bits_per_char_height);
+}
+
+// --- UTF-8 ---------------------------------------------------------------
+// The font table is indexed by Unicode codepoint, and the Cyrillic faces carry
+// U+0400..U+04FF. Strings arrive from Python as UTF-8, so iterating bytes would
+// feed each Cyrillic character to the lookup as two/three unrelated codepoints
+// and draw garbage (or nothing). Decode before every glyph lookup.
+//
+// Deliberately tolerant: a malformed lead byte is drawn as-is and the walk
+// advances by one, so a truncated string can never loop forever.
+
+static inline uint16_t utf8_next(const char **s) {
+    const uint8_t *p = (const uint8_t *)*s;
+    uint8_t c = *p;
+    if (c < 0x80) {
+        *s = (const char *)(p + 1);
+        return c;
+    }
+    uint8_t n;
+    uint16_t cp;
+    if ((c & 0xE0) == 0xC0) {        // 2-byte
+        n = 1; cp = c & 0x1F;
+    } else if ((c & 0xF0) == 0xE0) { // 3-byte (covers all of Cyrillic)
+        n = 2; cp = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) { // 4-byte
+        n = 3; cp = c & 0x07;
+    } else {                         // stray continuation / invalid
+        *s = (const char *)(p + 1);
+        return c;
+    }
+    for (uint8_t i = 1; i <= n; i++) {
+        if ((p[i] & 0xC0) != 0x80) {  // truncated sequence
+            *s = (const char *)(p + 1);
+            return c;
+        }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    *s = (const char *)(p + n + 1);
+    return cp;
 }
 
 int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str) {
@@ -179,7 +229,7 @@ int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str) {
     int8_t last_x_offset = 0;
 
     while (*str) {
-        uint16_t c = (uint8_t)*str++;
+        uint16_t c = utf8_next(&str);
         const uint8_t *glyph_data = font_get_glyph_data(font, &info, c);
         if (glyph_data) {
             cynthia_font_decode_t decode;
@@ -303,7 +353,7 @@ int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y
 
     int16_t start_x = x;
     while (*str) {
-        uint16_t c = (uint8_t)*str++;
+        uint16_t c = utf8_next(&str);
         int16_t delta = draw_glyph_vlsb(buf, font, &info, x, y, c, color);
         x += delta;
     }
@@ -351,4 +401,47 @@ float cynthia_ui_battery_voltage(void) {
 #else
     return 4.12f;
 #endif
+}
+
+// --- amyboard.Display compatibility: GS4 128x128 canvas -> 128x64 1-bit panel ---
+//
+// amyboardworld sketches are written against amyboard.Display's virtual
+// 128x128 GS4 (4-bit grayscale) canvas. CYNTHIA's panel is 128x64 1-bit.
+// Cropping the top 64 rows keeps the sketch's coordinate system intact (the
+// header/title rows every sketch draws land in the visible half), and
+// thresholding collapses the 16 gray levels to on/off.
+//
+// Loop cost: 128*64 = 8192 pixels. In C that's trivial; in Python it would
+// blow the ~30ms budget for a 33fps refresh, hence C.
+uint32_t cynthia_ui_blit_gs4_to_mono(const uint8_t *src, uint8_t *dst,
+                                     uint16_t rows, uint8_t thresh) {
+    if (src == NULL || dst == NULL || rows == 0 || rows > 128) {
+        return 0;
+    }
+    const uint16_t width = 128;
+    const uint16_t dst_stride = width;      // MONO_VLSB: one byte per x
+    uint32_t set = 0;
+
+    for (uint16_t page = 0; page < (rows + 7) / 8; page++) {
+        uint8_t *d = dst + (uint32_t)page * dst_stride;
+        uint16_t y0 = page * 8;
+        for (uint16_t x = 0; x < width; x++) {
+            uint8_t acc = 0;
+            for (uint16_t bit = 0; bit < 8; bit++) {
+                uint16_t y = y0 + bit;
+                if (y >= rows) {
+                    break;
+                }
+                const uint8_t *p = src + (((uint32_t)x + (uint32_t)y * width) >> 1);
+                uint8_t v = (x & 1) ? (*p & 0x0F) : (*p >> 4);
+                if (v >= thresh) {
+                    acc |= (uint8_t)(1u << bit);
+                }
+            }
+            d[x] = acc;
+            uint8_t t = acc;
+            while (t) { set += (t & 1u); t >>= 1; }
+        }
+    }
+    return set;
 }

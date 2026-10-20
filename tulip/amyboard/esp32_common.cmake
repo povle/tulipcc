@@ -161,6 +161,7 @@ list(APPEND MICROPY_SOURCE_PORT
     ${MICROPY_ESP32_DIR}/machine_rtc.c
     ${MICROPY_ESP32_DIR}/machine_sdcard.c
     ${MICROPY_ESP32_DIR}/modespnow.c
+    ${MICROPY_ESP32_DIR}/mpnimbleport.c
 )
 
 list(TRANSFORM MICROPY_SOURCE_BOARD PREPEND ${MICROPY_PORT_DIR}/)
@@ -246,7 +247,11 @@ list(APPEND MICROPY_SOURCE_QSTR
 list(APPEND IDF_COMPONENTS
     app_update
     bootloader_support
-    #bt
+    # Bluetooth: needed by MicroPython's `bluetooth` module. Only boards that
+    # turn BT on in sdkconfig actually compile the stack in (CONFIG_BT_ENABLED),
+    # so this is inert for the others; the component must still be listed for
+    # CONFIG_BT* to be honoured and for mpmimbleport.c to link.
+    bt
     driver
     esp_driver_tsens
     esp_adc
@@ -367,10 +372,11 @@ target_compile_options(${MICROPY_TARGET} PUBLIC
     -DLFS2_NO_DEBUG
 )
 
-# Additional include directories needed for private NimBLE headers.
-#target_include_directories(${MICROPY_TARGET} PUBLIC
-#    ${IDF_PATH}/components/bt/host/nimble/nimble
-#)
+# Additional include directories needed for private NimBLE headers
+# (mpnimbleport.c reaches into the NimBLE host internals).
+target_include_directories(${MICROPY_TARGET} PUBLIC
+    ${IDF_PATH}/components/bt/host/nimble/nimble
+)
 
 
 # Add additional extmod and usermod components.

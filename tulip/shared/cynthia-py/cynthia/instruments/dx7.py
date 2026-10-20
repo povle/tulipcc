@@ -75,6 +75,31 @@ class DX7Instrument:
             return DX7_PATCHES[self.patch_index][1]
         return 1
 
+    # --- User patch persistence (runtime §12) ---
+
+    def save_patch_state(self):
+        """State to persist for a user patch.
+
+        The DX7 has no front-panel editing (pots are locked, matching
+        InstrumentDX7.cpp), so patch selection IS the whole instrument state:
+        the patch index is all there is to remember. This method must exist
+        regardless — the runtime gates the whole save menu on
+        `hasattr(_engine, "save_patch_state")` (runtime.py), so without it
+        long-press Patch-Prev does nothing at all, which reads as a dead
+        button rather than a missing feature.
+        """
+        return {"patch_index": self.patch_index}
+
+    def load_patch_state(self, state):
+        """Restore a user patch: the DX7 only stores its patch index."""
+        if not state:
+            return
+        self.patch_index = state.get("patch_index", 0) % NUM_PATCHES
+        if not self._started:
+            self.init()
+        else:
+            amy.send(synth=SYNTH, patch=self.patch_index + PATCH_OFFSET)
+
     def update_pot(self, channel, value):
         # DX7 pots are locked in the original firmware — no live editing.
         pass

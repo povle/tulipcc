@@ -20,5 +20,6 @@ set(SDKCONFIG_DEFAULTS
 
 list(APPEND MICROPY_SOURCE_BOARD
     boards/CYNTHIA/cynthia_input.c
+    boards/CYNTHIA/cynthia_wdt.c
     boards/CYNTHIA/cynthia_ui.c
 )

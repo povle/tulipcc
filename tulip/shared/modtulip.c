@@ -764,6 +764,14 @@ extern void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_read
 extern int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str);
 extern int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color);
 extern float cynthia_ui_battery_voltage(void);
+extern uint32_t cynthia_ui_blit_gs4_to_mono(const uint8_t *src, uint8_t *dst, uint16_t rows, uint8_t thresh);
+extern void cynthia_wdt_arm(uint32_t timeout_ms);
+extern void cynthia_wdt_disarm(void);
+extern bool cynthia_wdt_is_armed(void);
+extern void cynthia_wdt_feed(void);
+extern uint32_t cynthia_wdt_take_reason(void);
+extern uint32_t cynthia_wdt_since_feed_ms(void);
+extern uint32_t cynthia_wdt_feed_count(void);
 #else
 static inline void cynthia_get_knobs(float *out_knobs, uint8_t count) {
     if (out_knobs) {
@@ -788,6 +796,14 @@ static inline void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_a
 static inline int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str) { return 0; }
 static inline int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color) { return 0; }
 static inline float cynthia_ui_battery_voltage(void) { return 4.12f; }
+static inline uint32_t cynthia_ui_blit_gs4_to_mono(const uint8_t *src, uint8_t *dst, uint16_t rows, uint8_t thresh) { return 0; }
+static inline void cynthia_wdt_arm(uint32_t timeout_ms) { (void)timeout_ms; }
+static inline void cynthia_wdt_disarm(void) {}
+static inline bool cynthia_wdt_is_armed(void) { return false; }
+static inline void cynthia_wdt_feed(void) {}
+static inline uint32_t cynthia_wdt_take_reason(void) { return 0; }
+static inline uint32_t cynthia_wdt_since_feed_ms(void) { return 0; }
+static inline uint32_t cynthia_wdt_feed_count(void) { return 0; }
 #endif
 
 STATIC mp_obj_t tulip_cynthia_knobs(void) {
@@ -881,6 +897,74 @@ STATIC mp_obj_t tulip_cynthia_battery_voltage(void) {
     return mp_obj_new_float(cynthia_ui_battery_voltage());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_battery_voltage_obj, tulip_cynthia_battery_voltage);
+
+// --- software watchdog ------------------------------------------------------
+// Arm/feed/disarm from Python. The check itself lives in the CYNTHIA input task
+// (C, core 0) so it survives a hung VM; see cynthia_wdt.h for why this exists
+// rather than relying on the IDF task watchdog.
+
+STATIC mp_obj_t tulip_cynthia_wdt_arm(size_t n_args, const mp_obj_t *args) {
+    uint32_t timeout_ms = 0;
+    if (n_args > 0) {
+        timeout_ms = (uint32_t)mp_obj_get_int(args[0]);
+    }
+    cynthia_wdt_arm(timeout_ms);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_wdt_arm_obj, 0, 1, tulip_cynthia_wdt_arm);
+
+STATIC mp_obj_t tulip_cynthia_wdt_disarm(void) {
+    cynthia_wdt_disarm();
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_wdt_disarm_obj, tulip_cynthia_wdt_disarm);
+
+STATIC mp_obj_t tulip_cynthia_wdt_feed(void) {
+    cynthia_wdt_feed();
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_wdt_feed_obj, tulip_cynthia_wdt_feed);
+
+STATIC mp_obj_t tulip_cynthia_wdt_reason(void) {
+    return mp_obj_new_int_from_uint(cynthia_wdt_take_reason());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_wdt_reason_obj, tulip_cynthia_wdt_reason);
+
+STATIC mp_obj_t tulip_cynthia_wdt_status(void) {
+    mp_obj_t items[3] = {
+        mp_obj_new_bool(cynthia_wdt_is_armed()),
+        mp_obj_new_int_from_uint(cynthia_wdt_since_feed_ms()),
+        mp_obj_new_int_from_uint(cynthia_wdt_feed_count()),
+    };
+    return mp_obj_new_tuple(3, items);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_wdt_status_obj, tulip_cynthia_wdt_status);
+
+// tulip.cynthia_blit_gs4(src, dst, rows=64, thresh=8)
+// Blit amyboard.Display's 128x128 GS4 canvas onto a 128x64 MONO_VLSB panel buf.
+STATIC mp_obj_t tulip_cynthia_blit_gs4(size_t n_args, const mp_obj_t *args) {
+    mp_buffer_info_t srcinfo, dstinfo;
+    mp_get_buffer_raise(args[0], &srcinfo, MP_BUFFER_READ);
+    mp_get_buffer_raise(args[1], &dstinfo, MP_BUFFER_WRITE);
+    uint16_t rows = 64;
+    uint8_t thresh = 8;
+    if (n_args > 2) {
+        rows = (uint16_t)mp_obj_get_int(args[2]);
+    }
+    if (n_args > 3) {
+        thresh = (uint8_t)mp_obj_get_int(args[3]);
+    }
+    if (srcinfo.len < 128 * 128 / 2) {
+        mp_raise_ValueError(MP_ERROR_TEXT("src must be >= 8192 bytes (128x128 GS4)"));
+    }
+    if (dstinfo.len < (uint32_t)128 * ((rows + 7) / 8)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("dst too small"));
+    }
+    return mp_obj_new_int(cynthia_ui_blit_gs4_to_mono((const uint8_t *)srcinfo.buf,
+                                                      (uint8_t *)dstinfo.buf,
+                                                      rows, thresh));
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_blit_gs4_obj, 2, 4, tulip_cynthia_blit_gs4);
 
 #endif // ESP_PLATFORM
 
@@ -1993,6 +2077,12 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_cynthia_str_width), MP_ROM_PTR(&tulip_cynthia_str_width_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_draw_str), MP_ROM_PTR(&tulip_cynthia_draw_str_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_battery_voltage), MP_ROM_PTR(&tulip_cynthia_battery_voltage_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_wdt_arm), MP_ROM_PTR(&tulip_cynthia_wdt_arm_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_wdt_disarm), MP_ROM_PTR(&tulip_cynthia_wdt_disarm_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_wdt_feed), MP_ROM_PTR(&tulip_cynthia_wdt_feed_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_wdt_reason), MP_ROM_PTR(&tulip_cynthia_wdt_reason_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_wdt_status), MP_ROM_PTR(&tulip_cynthia_wdt_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_blit_gs4), MP_ROM_PTR(&tulip_cynthia_blit_gs4_obj) },
 #endif
 #else
     #if !defined(AMYBOARD_WEB) && !defined(AMYBOARD_VCV)

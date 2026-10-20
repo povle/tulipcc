@@ -16,6 +16,12 @@
 // No DAC on Cynthia
 #define MICROPY_PY_MACHINE_DAC (0)
 
+// Bluetooth LE (BLE-MIDI peripheral, cynthia/ble_midi.py). The esp32 port
+// disables MicroPython's `bluetooth` module for Tulip boards by default; this
+// opts CYNTHIA back in. The stack itself is selected by CONFIG_BT_* in
+// boards/CYNTHIA/sdkconfig.board (NimBLE, peripheral role).
+#define MICROPY_BOARD_WANTS_BLUETOOTH (1)
+
 // TinyUSB buffer sizes
 #define CFG_TUD_MIDI_RX_BUFSIZE 512
 #define CFG_TUD_MIDI_TX_BUFSIZE 64

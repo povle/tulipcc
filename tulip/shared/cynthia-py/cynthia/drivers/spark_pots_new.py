@@ -44,6 +44,20 @@ DEADZONE_RAW = 60
 MUX_SETTLE_US = 100
 ADC_SETTLE_US = 20
 
+# Minimum gap between full scans. One scan blocks ~3.8ms in SPI settles; the UI
+# poll's budget is ~10ms, so scanning every poll burned ~37% of it. 20ms (50Hz)
+# is far faster than a hand can turn a pot and leaves the poll responsive.
+SCAN_PERIOD_MS = 20
+
+
+def _ticks_diff(a, b):
+    """Wrap-safe difference using MicroPython's ticks_diff when available."""
+    try:
+        import time as _t
+        return _t.ticks_diff(a, b)
+    except Exception:
+        return a - b
+
 # MUX0_MAP[addr] = sensor number (1-based) routed to MCP3002 CH0 (phase 0)
 # MUX1_MAP[addr] = sensor number (1-based) routed to MCP3002 CH1 (phase 1)
 MUX0_MAP = (8, 7, 6, 5, 4, 3, 2, 1, 16, 15, 14, 13, 12, 11, 10, 9)
@@ -69,6 +83,7 @@ class Driver:
         self._rx = bytearray(2)
         # Knob values 0..1 (angle / 360), exposed via knobs().
         self.values = [0.0] * NUM_POTS
+        self._last_scan_ms = None
         # NeoPixels (optional, §10.2) — only if configured.
         self._leds = None
         self._led_mode = "auto"
@@ -191,6 +206,22 @@ class Driver:
             self._update_leds_auto()
 
     def poll(self, now_ms=None):
+        """Scan at a PACED rate, not on every call.
+
+        A full scan is 16 addresses x (mux settle + 2 ADC reads) = ~3.8ms of
+        BLOCKING time.sleep_us settles. surface.poll() runs from the UI poll at
+        ~96Hz, whose whole budget is ~10ms, so scanning every call burned ~37% of
+        the frame in busy-waiting — and starved the same poll that feeds the
+        software watchdog. Pots are mechanical; nobody can turn 16 of them faster
+        than ~50Hz. Pace it so a scan costs at most a fraction of the budget.
+        """
+        if now_ms is None:
+            import time
+            now_ms = time.ticks_ms()
+        last = getattr(self, "_last_scan_ms", None)
+        if last is not None and _ticks_diff(now_ms, last) < SCAN_PERIOD_MS:
+            return
+        self._last_scan_ms = now_ms
         self.scan()
 
     def knobs(self):

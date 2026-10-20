@@ -14,3 +14,50 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="boards/CYNTHIA/tulip-partitions-16MB.csv
 # Enable FreeRTOS trace facility for uxTaskGetSystemState (used by compute_cpu_usage)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# --- Task watchdog MUST reset, not just warn -------------------------------
+# Default ESP-IDF behaviour is CONFIG_ESP_TASK_WDT_PANIC=n, which only PRINTS
+# "task_wdt: Task watchdog got triggered" and then keeps going. On CYNTHIA that
+# is the difference between a recoverable board and a brick: a user sketch that
+# blocks in loop() (or a REPL session left in a long Python loop) starves the
+# idle task forever, the app never returns to the REPL, and the only recovery is
+# unplugging USB. Reproduced repeatedly during development.
+#
+# With PANIC=y the watchdog takes the same path as a panic (including the
+# bootloader's WDT, which is already enabled above with a 9s timeout), so a
+# wedged board reboots itself and comes back at the REPL.
+CONFIG_ESP_TASK_WDT_PANIC=y
+# Watch the idle tasks (this is what actually catches "someone is hogging the
+# CPU and nothing else can run"). The MP task itself is additionally guarded in
+# Python: see amyboard.py's boot-attempt counter and loop() time budget, which
+# turn a reboot loop into a recoverable "safe mode".
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
+# --- Bluetooth LE (BLE MIDI) ----------------------------------------------
+# CYNTHIA can act as a BLE-MIDI peripheral: the 28 keys, pots, joystick and
+# buttons are forwarded to a host (phone/DAW) as standard BLE-MIDI, and MIDI
+# arriving from the host is injected into the same parser the internal
+# controls use (cynthia/midi.py), so a sketch cannot tell them apart.
+#
+# NimBLE only (not Bluedroid): it is the smaller host, and MicroPython's
+# `bluetooth` module is written against it on ESP32. Peripheral role only, so
+# the controller can be built without scanning/central support.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# MicroPython derives its BLE sync-event stack as
+# (CONFIG_BT_NIMBLE_TASK_STACK_SIZE - 1024), so the IDF default of 4096 leaves
+# only 3072 bytes for the Python callbacks that handle BLE-MIDI writes.
+#
+# NOTE the symbol name: CONFIG_BT_NIMBLE_TASK_STACK_SIZE is a RENAMED legacy
+# name (see components/bt/sdkconfig.rename) whose real setting is
+# CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE. Setting the legacy name in this file is
+# silently dropped — it does not appear in the generated sdkconfig. Set the real
+# one; 8192 gives MicroPython 7168 bytes of sync-event stack.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_NVS_PERSIST=y

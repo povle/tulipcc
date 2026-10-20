@@ -25,8 +25,19 @@
 
 #define MICROPY_HW_ENABLE_SDCARD            (1)
 #define MICROPY_PY_MACHINE_I2S              (0)
+// Tulip boards ship without Bluetooth by default (flash/RAM budget, and most
+// have no radio use). A board that does want it sets
+// MICROPY_BOARD_WANTS_BLUETOOTH in its mpconfigboard.h; leaving
+// MICROPY_PY_BLUETOOTH undefined here lets the upstream block further down
+// fill in the NimBLE/sync-event configuration correctly.
+//
+// NOTE: this file is COPIED over micropython/ports/esp32/mpconfigport.h by
+// amyboard/CMakeLists.txt on every build, so this is the only copy that
+// matters — editing the submodule one has no effect.
+#ifndef MICROPY_BOARD_WANTS_BLUETOOTH
 #define MICROPY_PY_BLUETOOTH (0)
 #define MICROPY_BLUETOOTH_NIMBLE (0)
+#endif
 
 #define MICROPY_ENABLE_SCHEDULER (1)
 #define MICROPY_SCHEDULER_DEPTH             (128)
@@ -122,6 +133,20 @@
 #define MICROPY_BLUETOOTH_NIMBLE            (1)
 #define MICROPY_BLUETOOTH_NIMBLE_BINDINGS_ONLY (1)
 #endif
+
+#if MICROPY_PY_BLUETOOTH && defined(MICROPY_BOARD_WANTS_BLUETOOTH)
+// CYNTHIA runs BLE-MIDI only: a plain peripheral that advertises one service.
+// Two upstream defaults have to go for it to build against IDF 5.4's NimBLE:
+//   - PAIRING_BONDING: MicroPython's bonding code still uses the pre-5.x
+//     ble_store_key_sec field `ediv_rand_present` (renamed in IDF 5.4), so it
+//     does not compile. BLE-MIDI needs no bonding.
+//   - CENTRAL_MODE: we never scan or connect out, and the code size is real.
+#undef MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING
+#define MICROPY_PY_BLUETOOTH_ENABLE_PAIRING_BONDING (0)
+#undef MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE
+#define MICROPY_PY_BLUETOOTH_ENABLE_CENTRAL_MODE (0)
+#endif
+
 #define MICROPY_PY_HASHLIB_MD5              (1)
 #define MICROPY_PY_HASHLIB_SHA1             (1)
 #define MICROPY_PY_HASHLIB_SHA256           (1)

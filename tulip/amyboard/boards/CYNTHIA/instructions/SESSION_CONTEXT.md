@@ -1,9 +1,10 @@
 # CYNTHIA × tulipcc — Full Session Context
 
 > **Purpose**: hand this file to a fresh AI session (or human) and they can continue
-> work on the CYNTHIA port without re-deriving anything. Last updated 2026-10-09 (dedicated C input task & hardware mapping completed).
+> work on the CYNTHIA port without re-deriving anything. Last updated 2026-10-16 (sketch robustness: watchdog reset, boot guard, loop() budget).
 > Companion files in this directory: `PORT_NOTES.md` (issue history #1–#12),
-> `PATCHES.md` (exact patch sites for future merges).
+> `PATCHES.md` (exact patch sites for future merges),
+> `AMYWORLD_RESEARCH.md` (§9 sketch library, §10 encoder facade, §12 sketch robustness).
 
 ---
 
@@ -329,3 +330,62 @@ Juno `update_pot()` handles all 16 channels matching `InstrumentJuno.cpp`:
 - DX7 carrier boxes use `fill_rect` + black text (not broken XOR).
 - Custom patch save/load API is in place; button-triggered patch browser UI is pending.
 - Battery voltage returns to normal header (joystick display removed).
+
+---
+
+## 11. AMYboard World / instrument library
+
+**See `AMYWORLD_RESEARCH.md`** in this directory for the full write-up (it is the
+authoritative doc; §9 there covers the implementation).
+
+**Status 2026-10-16:** the *outbound* direction is **implemented** — a sketch
+written in the web editor is also filed into CYNTHIA's instrument library. The
+*inbound* direction (browsing/fetching World from the device) remains research
+only, and the on-board-wifi attempt was **deliberately dropped** (out of scope).
+
+### Implemented (outbound)
+
+Two new frozen modules + one additive wrap; web editor untouched:
+
+- `cynthia/naming.py` — name heuristic: `# DESCRIPTION:` line (91% of corpus) ->
+  filename stem -> header comment -> `sketch`. Slugs are path-safe, whole-word
+  truncated, median 15 chars.
+- `cynthia/library.py` — `archive()`: validates, then installs
+  `/user/instruments/<slug>/{sketch.py,meta.json}`. Copy (non-destructive),
+  idempotent (the callback fires twice per upload), collision gets `-2` rather
+  than merging.
+- `cynthia/compat.py` — wraps `environment_transfer_done` (original still runs, so
+  the restart is preserved). One patch covers both call sites: `_boot.py` already
+  calls `compat.install()`.
+
+Verified: firmware builds clean (2.87 MB / 866 KB free), all three modules frozen
+in; behaviour tested under the **real MicroPython** unix port with a fake device
+FS. **Not yet flashed / not yet exercised against the live web editor.**
+
+Two bugs the real interpreter caught that CPython hid: MicroPython `str` has **no
+`isalnum()`**, and `bytes` reaching the text parser. Both fixed. Also absent on
+this port: `os.path`, `open(..., encoding=...)`.
+
+### Still research only
+
+- **Inbound (World -> device)** — needs an on-device network story we have not
+  chosen. Note the *inbound* API supplies real `description`/`username`/`tags`,
+  so inbound naming is the easy direction.
+- **No on-board wifi.** The browser already has network; use that.
+
+### Settled findings worth keeping
+
+- **Taxonomy:** a World sketch *is* an instrument (whole-instrument scope), unlike
+  a patch (parameters inside one). "Browse World" is a second *source* for the
+  existing instrument browser, not a new mode.
+- **Device receives no sketch name on outbound.** The editor writes only
+  `/user/current/sketch.py` (both call sites hardcoded; `opts.sketchPath` is
+  plumbed but never overridden) and `packageName` never crosses the wire.
+- **Corpus is 79% one automated account** (`generator`, 491/622). Human-authored
+  subset is 131 sketches / 1.03 MB compressed — fits `vfs` with 1.26 MB spare.
+- **Safety gaps confirmed:** `_MAX_LOOP_FAILS` catches raising `loop()`s but there
+  is no *time* budget (hangs starve the sequencer); no boot-attempt counter; and
+  CYNTHIA does **not** get the boot-button skip (`_boot.py:180` is AMYBOARD-only),
+  so a hard-faulting sketch means USB reflash.
+- **Transport:** Bluetooth not required — WebMIDI over the existing USB-CDC gadget
+  is enough. Wi-Fi only matters for World browsing, which is not implemented.
