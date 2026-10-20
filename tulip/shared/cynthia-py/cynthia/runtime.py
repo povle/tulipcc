@@ -446,6 +446,7 @@ def play(name):
     # look like a movement.
     _arm_pot_pickup()
     _start_poll()
+    _schedule_ble_start()
 
     pname = current_patch_name()
     print("cynthia: %s ready%s" % (name, (" — patch: " + pname) if pname else ""))
@@ -512,6 +513,7 @@ def attach_current(name):
     surface.start()
     _arm_pot_pickup()
     _start_poll()
+    _schedule_ble_start()
     if name is None:
         print("cynthia: no instrument attached (no engine; UI stays generic)")
         # Paint the generic UI (header + brand) so the panel shows a live state
@@ -720,12 +722,46 @@ def _draw_toast(disp):
 
 _last_ble_seq = 0
 _low_batt_at = 0
+_ble_start_at = None       # ticks_ms when BLE should come up (None = not queued)
+_ble_trust_at = None       # when an up-and-running radio stops being suspect
+
+
+def _schedule_ble_start(delay_ms=2500):
+    """Queue the BLE radio to start after the UI has been stable for a while."""
+    global _ble_start_at
+    _ble_start_at = time.ticks_add(time.ticks_ms(), delay_ms)
+
+
+def _maybe_start_ble(now):
+    """Bring BLE up once, off the boot path, and clear the crash marker after it
+    has survived a few seconds."""
+    global _ble_start_at, _ble_trust_at
+    if _ble_start_at is not None and time.ticks_diff(now, _ble_start_at) >= 0:
+        _ble_start_at = None
+        try:
+            from . import settings as _settings
+            if _settings.get("ble_midi_enabled"):
+                _ble_mod.arm_pending()       # BEFORE start: a panic is fatal
+                ok = _ble_mod.start(name=_settings.get("ble_name"))
+                if ok:
+                    _ble_trust_at = time.ticks_add(now, 10000)
+                    print("cynthia: BLE MIDI advertising")
+                else:
+                    _ble_mod.clear_pending()
+                    toast(t("ble_error"), 1500)
+        except Exception as e:
+            _ble_mod.clear_pending()
+            print("cynthia: BLE start failed:", e)
+    if _ble_trust_at is not None and time.ticks_diff(now, _ble_trust_at) >= 0:
+        _ble_trust_at = None
+        _ble_mod.clear_pending()
 
 
 def _poll_notices(now):
     """Rare, cheap notifications: BLE link up, battery low."""
     global _last_ble_seq, _low_batt_at
     try:
+        _ble_mod.service()      # re-advertise after a disconnect, if needed
         seq = _ble_mod.connection_seq()
         if seq != _last_ble_seq:
             _last_ble_seq = seq
@@ -888,6 +924,8 @@ def _poll_body(tick):
     # repaint (up to _REFRESH_MS).
     if _toast_text is not None and not _toast_active(now):
         mark_dirty()
+
+    _maybe_start_ble(now)
 
     if _pots_active and (_tick % 12) == 0:
         # Live bars: ~8Hz is plenty and keeps I2C traffic modest.
@@ -1385,6 +1423,7 @@ def _settings_step(key, kind, delta):
         # that you would reflash), not the advertising.
         _ble = _ble_mod
         if new:
+            _ble.arm_pending()
             if _ble.start(name=_settings.get("ble_name")):
                 print("cynthia: BLE MIDI enabled")
             else:

@@ -340,22 +340,22 @@ if board() == "CYNTHIA":
             _csettings.apply_to_runtime()
         except Exception as _se:
             print("_boot: CYNTHIA settings apply failed:", _se)
-        # BLE-MIDI (§16): only when enabled in settings. Started AFTER the
-        # instrument is attached so the prompt reflects the real play state; the
-        # coroutine runs on the same asyncio loop uasyncio/serial already uses.
+        # BLE-MIDI (§16). NOT started here: bringing up the radio during boot
+        # means any fault in it takes the whole boot down with no way to reach
+        # the REPL or the UI. The runtime starts it a couple of seconds into a
+        # stable PLAY session instead (see runtime._maybe_start_ble).
+        #
+        # Crash-loop guard: a marker written before the radio starts tells the
+        # next boot that the previous one died with BLE, so it can turn BLE off
+        # rather than panic again.
         try:
             from cynthia import ble_midi as _ble, settings as _cs2
-            if _cs2.get("ble_midi_enabled"):
-                # start() is synchronous: the raw bluetooth API advertises and
-                # delivers events via IRQ, so no asyncio task is involved.
-                if _ble.start(name=_cs2.get("ble_name")):
-                    print("_boot: CYNTHIA BLE-MIDI advertising as %r"
-                          % _cs2.get("ble_name"))
-                else:
-                    print("_boot: CYNTHIA BLE-MIDI failed:",
-                          _ble.status()["error"])
+            if _ble.consume_pending():
+                print("_boot: CYNTHIA BLE crashed the previous boot — disabling")
+                _cs2.set("ble_midi_enabled", False)
+                _ble.clear_pending()
         except Exception as _be:
-            print("_boot: CYNTHIA BLE-MIDI start failed:", _be)
+            print("_boot: CYNTHIA BLE guard failed:", _be)
     except Exception as _e:
         print("_boot: CYNTHIA cynthia init failed:", _e)
 

@@ -60,4 +60,7 @@ CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
 # one; 8192 gives MicroPython 7168 bytes of sync-event stack.
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# No bonding (compiled out in mpconfigport.h), so there is nothing to persist.
+# Leaving the NVS store enabled only pulls flash-write machinery into the radio
+# path for no benefit.
+CONFIG_BT_NIMBLE_NVS_PERSIST=n

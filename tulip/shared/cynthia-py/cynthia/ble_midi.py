@@ -71,6 +71,7 @@ _state = {
     "conn_seq": 0,
 }
 
+_need_adv = False
 _ble = None
 _conn = None
 _handle = None
@@ -80,6 +81,51 @@ _irq_set = False
 def status():
     """Snapshot for the settings screen / REPL diagnostics."""
     return dict(_state)
+
+
+PENDING_PATH = "/user/ble_pending"
+
+
+def arm_pending():
+    """Note on flash that BLE is being brought up.
+
+    If the board panics inside the radio stack, nothing can catch it — the
+    firmware just reboots. Writing this marker BEFORE start() means the next
+    boot can tell "we died with BLE" and turn it off, instead of panic-looping
+    with no way back to a working synth.
+    """
+    try:
+        with open(PENDING_PATH, "w") as f:
+            f.write("1")
+    except OSError:
+        pass
+
+
+def clear_pending():
+    """BLE has been up long enough to be trusted: remove the marker."""
+    try:
+        import os
+        os.remove(PENDING_PATH)
+    except OSError:
+        pass
+
+
+def consume_pending():
+    """True if the previous boot died while BLE was starting/active."""
+    try:
+        with open(PENDING_PATH) as f:
+            f.read()
+        return True
+    except OSError:
+        return False
+
+
+def service():
+    """Housekeeping driven by the UI poll (VM thread): re-advertise, trust."""
+    global _need_adv
+    if _need_adv and _state["enabled"] and not _state["connected"]:
+        _need_adv = False
+        _advertise()
 
 
 def is_connected():
@@ -156,21 +202,27 @@ def _advertise():
 # --- IRQ ------------------------------------------------------------------
 
 def _irq(event, data):
-    global _conn
+    """GATT/GAP interrupt. Runs on the NimBLE task (core 0).
+
+    Keep this to state changes plus the two calls that MUST happen here
+    (reading the written value, and handing it to the VM). Never print and never
+    call gap_advertise: both run VM/IDF code on the radio task while the
+    MicroPython task is on core 1, and a panic inside it takes the whole board
+    down. Re-advertising is done by the poll (_service()).
+    """
+    global _conn, _need_adv
     if event == _IRQ_CENTRAL_CONNECT:
         conn_handle, _addr_type, _addr = data
         _conn = conn_handle
         _state["connected"] = True
         _state["advertising"] = False
         _state["conn_seq"] += 1
-        print("cynthia: BLE MIDI connected")
     elif event == _IRQ_CENTRAL_DISCONNECT:
         _conn = None
         _state["connected"] = False
-        print("cynthia: BLE MIDI disconnected — advertising again")
-        # iOS drops the link when it backgrounds the app; keep advertising so
-        # re-pairing does not need a reboot (the C++ version did the same).
-        _advertise()
+        # iOS drops the link when it backgrounds the app; ask the poll to
+        # advertise again so re-pairing does not need a reboot.
+        _need_adv = True
     elif event == _IRQ_GATTS_WRITE:
         conn_handle, attr_handle = data
         if attr_handle != _handle:
@@ -179,12 +231,15 @@ def _irq(event, data):
             payload = bytes(_ble.gatts_read(attr_handle))
         except Exception:
             return
-        # Do NOT call into AMY from the NimBLE task: hand the bytes to the VM
-        # thread. cynthia_input.c uses mp_sched_schedule for the same reason.
+        # Hand the bytes to the VM thread; never run AMY code here. The old
+        # fallback called _deliver() inline when the scheduler queue was full,
+        # which meant midi.inject() -> tulip.midi_local() ran on the NimBLE task
+        # concurrently with AMY's own MIDI task on the same core.
         try:
             micropython.schedule(_deliver, payload)
         except Exception:
-            _deliver(payload)
+            _state["rx_dropped"] = _state.get("rx_dropped", 0) + 1
+            _state["error"] = "rx queue full"
 
 
 def _deliver(payload):

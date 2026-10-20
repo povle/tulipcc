@@ -716,8 +716,33 @@ NimBLE only (MicroPython's esp32 binding targets it), peripheral + broadcaster.
 shorter `CONFIG_BT_NIMBLE_TASK_STACK_SIZE` is a renamed-legacy alias that is
 silently dropped from `sdkconfig.board`. MicroPython derives its BLE sync-event
 stack as `(that - 1024)`, giving 7168 bytes of callback stack instead of 3072.
-Cost: ~200 KB flash, 17% of the app partition still free. BLE starts at boot when
-`ble_midi_enabled` is set (default on); the settings toggle starts/stops it live.
+Cost: ~200 KB flash, 17% of the app partition still free.
+
+**BLE is NOT started during boot.** A fault in the radio stack during boot takes
+the whole boot down — no REPL, no UI, nothing to recover with (observed as
+`Guru Meditation Error: Core 0 panic'ed (StoreProhibited)` right after flashing).
+The runtime starts it ~2.5 s into a stable PLAY session
+(`runtime._maybe_start_ble`), and the settings toggle starts/stops it live.
+
+Two rules for the IRQ handler, both learned the hard way:
+
+- **No `print()` and no `gap_advertise()` from the IRQ.** It runs on the NimBLE
+  task (core 0) while MicroPython runs on core 1; running VM/IDF code there is
+  how a radio event turns into a panic. The handler only records state, reads
+  the written value, and hands it to the VM with `micropython.schedule()`.
+  Re-advertising after a disconnect is done by `ble_midi.service()` from the
+  poll. If the scheduler queue is full the packet is dropped — the earlier code
+  called `_deliver()` inline, i.e. ran AMY's MIDI injection on the NimBLE task
+  concurrently with AMY's own MIDI task on the same core.
+- **NimBLE NVS persistence is off** (`CONFIG_BT_NIMBLE_NVS_PERSIST=n`): bonding
+  is compiled out, so there is nothing to store and no flash path in the radio.
+
+**Crash-loop guard.** Before the radio starts, `ble_midi.arm_pending()` writes
+`/user/ble_pending`. It is removed once BLE has run for 10 s without dying. If
+the file is still there at boot, the previous boot died with BLE active, so
+`_boot.py` sets `ble_midi_enabled=false` and clears it. A panic in the radio
+therefore costs one reboot, not a boot loop — and BLE can be re-enabled from
+Settings once the cause is understood.
 
 ---
 
