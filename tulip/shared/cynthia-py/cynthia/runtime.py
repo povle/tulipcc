@@ -471,7 +471,7 @@ def attach_current(name):
     sketch; it just grabs the already-imported engine and starts the surface poll
     loop so pots/buttons/display are routed. Call after registry.start().
     """
-    global _engine, _sketch_mod, _name, _running, _patch_provider, _tick
+    global _engine, _sketch_mod, _name, _name_label, _running, _patch_provider, _tick
 
     _sketch_mod = _current_sketch()
     # Do NOT bail out when there is no sketch. Returning here left the poll
@@ -496,6 +496,17 @@ def attach_current(name):
         _patch_provider = _engine
 
     _name = name
+    # Boot must resolve the friendly name too: without this the header showed
+    # the folder slug ("WAVETABLE-PAD") until the instrument was re-selected,
+    # while the menu and REPL showed "Wavetable Pad".
+    if name:
+        try:
+            from . import browser as _br
+            _name_label = _br._meta_name(name)
+        except Exception:
+            _name_label = name
+    else:
+        _name_label = None
     _running = True
     _tick = 0
     surface.start()
@@ -814,13 +825,18 @@ def _poll_body(tick):
     _drain_midi_tap()
 
     # Joystick → MIDI pitch bend (X axis) + modulation (Y axis), C++ style.
+    #
+    # Only in PLAY. The same stick navigates the browser, settings, patch list
+    # and pots screens; sending bend/CC1 while doing that bent the note you were
+    # holding and moved the mod wheel every time you scrolled a menu.
     joy = surface.joystick()
+    ui_open = (_menu_active or _settings_active or _save_menu_active
+               or _patch_list_active or _pots_active)
     if joy is not None:
         jx, jy, j_btn = joy
-        # `midi` is already imported at module scope; re-importing it here ran a
-        # sys.modules lookup 30x/sec for nothing.
-        midi.pitch_bend((jx - 0.5) * 2.0)
-        midi.cc(1, jy * 127)
+        if not ui_open:
+            midi.pitch_bend((jx - 0.5) * 2.0)
+            midi.cc(1, jy * 127)
 
     # Joystick menu navigation (C++ System.cpp handleInstrumentMenu).
     if _menu_active:
