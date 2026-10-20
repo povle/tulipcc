@@ -609,6 +609,13 @@ ASCII-only; the Cyrillic faces make it live. Fixed to match u8g2.
 
 ### 13.2b Pot pickup, input latency, and why controls went dead
 
+**Instrument browser: grid or list.** `menu_style` in Settings switches the
+browser between the original 2x3 tile grid and a one-column list (6 visible
+rows, scrolling, Settings as the last entry). The grid wastes most cells once
+there are only a few instruments, and its tile labels are truncated; the list is
+the better default for a small library, but the grid is kept because it matches
+the original hardware.
+
 **Pot pickup.** Loading a patch applies its parameter values, and the next poll
 then fed the *physical* pot positions through `update_pot()` — overwriting them
 within a few frames. That is the "the settings change on startup" report. A pot
@@ -640,6 +647,19 @@ skipped, so Settings is reachable with a single instrument (previously stepping
 onto an empty row clamped the cursor back). More than 6 instruments **page**
 instead of silently disappearing; left/right walks every slot, and a page change
 shows `n/pages`.
+
+### 13.2c Instruments own the synth — no AMYboard boot defaults
+
+`amyboard.start_amy()` and `_apply_knobs_text()` install AMYboard's boot state
+with **queued raw wire messages**: `S<RESET_SYNTHS>`, `i1K257iv6` (the default
+Juno patch) and `i10K384iv1` (GM drums). Those are drained by AMY *later* than a
+sketch's `amy.send()`, so on CYNTHIA they arrived after the DX7 sketch had set its
+patch and silently replaced it — the reported "stays on the right patch for a
+second, then loads the first Juno patch". Both are now skipped when
+`tulip.board() == "CYNTHIA"`: a CYNTHIA instrument is a full engine that
+configures synth 1 itself, and `_auto_generated_knobs` lines are still applied.
+Consequence: the implicit GM drum kit on channel 10 is no longer installed; a
+sketch that wants drums must say so in its knob lines (amyworld sketches do).
 
 ### 13.3 BLE-MIDI (port of the original `InstrumentBLE.cpp`)
 

@@ -416,11 +416,23 @@ def _apply_knobs_text(knobs_text):
     channel with iv0. We never grab or merge live AMY state here — what the
     sketch says is exactly what the board becomes.
     """
-    amy.send_raw("S%dZ" % amy.RESET_SYNTHS)
-    amy.send_raw("i1K257iv6Z")
-    amy.send_raw("i10K384iv1Z")
-    if not knobs_text:
-        return
+    #
+    # CYNTHIA is exempt. Its instruments are full engines that configure synth 1
+    # themselves (patch + num_voices) in their sketch's top-level code, and the
+    # AMYboard defaults below are *queued raw wire messages*: they are drained
+    # by AMY later than the sketch's already-applied patch, so booting into DX7
+    # sounded right for a second and then silently became Juno patch 1
+    # (`i1K257` = Juno patch 257 -> bank offset 1). Only the sketch's explicit
+    # knob lines, if any, are applied there.
+    if tulip.board() == "CYNTHIA":
+        if not knobs_text:
+            return
+    else:
+        amy.send_raw("S%dZ" % amy.RESET_SYNTHS)
+        amy.send_raw("i1K257iv6Z")
+        amy.send_raw("i10K384iv1Z")
+        if not knobs_text:
+            return
     for line in knobs_text.strip().split('\n'):
         line = line.strip()
         if line and not line.startswith('#'):
@@ -547,8 +559,13 @@ def start_amy():
     # Boot defaults so the board makes sound before (or without) a sketch:
     # the amyboard patch on channel 1 and GM drums (kit 0, TR-808) on channel
     # 10. Sketch startup re-applies these via _apply_knobs_text.
-    amy.send_raw("i1K257iv6Z")
-    amy.send_raw("i10K384iv1Z")
+    #
+    # Not on CYNTHIA: there is no "before a sketch" state (the runtime always
+    # restores an instrument), and these queued raw messages arrive after the
+    # sketch's patch, replacing it.
+    if tulip.board() != "CYNTHIA":
+        amy.send_raw("i1K257iv6Z")
+        amy.send_raw("i10K384iv1Z")
     _env_dir = _ensure_current_env_layout()
 
     if tulip.bootloader_mode():

@@ -35,6 +35,10 @@ DEFAULTS = {
     # and is only discoverable from a menu. Toggleable in Settings.
     "ble_midi_enabled": True,
     "ble_name": "CYNTHIA",
+    # Instrument browser presentation: "grid" (2x3 tiles) or "list" (one
+    # column). The grid wastes most of its cells once you have a handful of
+    # instruments, and truncated tile labels are hard to scan.
+    "menu_style": "grid",
 }
 
 _cache = None

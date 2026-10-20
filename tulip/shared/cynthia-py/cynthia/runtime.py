@@ -314,6 +314,62 @@ def _menu_selected_index():
     return _menu_sel if _menu_sel < len(_menu_insts) else None
 
 
+def _menu_style():
+    """Browser presentation: "grid" (2x3) or "list" (one column)."""
+    try:
+        from . import settings as _settings
+        v = _settings.get("menu_style")
+        return v if v in ("grid", "list") else "grid"
+    except Exception:
+        return "grid"
+
+
+def _draw_menu_list(disp):
+    """One-column browser: every instrument, then Settings, with a window.
+
+    Six rows fit (8px each after the header divider). The window follows the
+    selection, so the same navigation model works for any number of entries.
+    """
+    n = len(_menu_insts)
+    total = n + (1 if _menu_includes_settings else 0)
+    line_h = 8
+    visible = 6
+    start_y = 18
+    sel = _menu_sel
+    top = sel - visible + 1
+    if top < 0:
+        top = 0
+    if top > total - visible:
+        top = total - visible
+    if top < 0:
+        top = 0
+
+    for i in range(visible):
+        idx = top + i
+        if idx >= total:
+            break
+        y = start_y + i * line_h
+        if idx < n:
+            label, slug = _menu_labels[idx] if idx < len(_menu_labels) else ("?", "?")
+            text = disp.fit_text(display.FONT_5X7, label, 118)
+        else:
+            text = t("settings")
+        if idx == sel:
+            disp.fill_rect(0, y - 6, 128, line_h, 1)
+            disp.draw_str(display.FONT_5X7, 2, y, text, 0)
+        else:
+            disp.draw_str(display.FONT_5X7, 2, y, text, 1)
+
+    # Thin scrollbar when the list is longer than the window.
+    if total > visible:
+        track_y, track_h = 14, 48
+        disp.rect(126, track_y, 2, track_h, 1)
+        thumb_h = max(4, (visible * track_h) // total)
+        denom = total - visible
+        off = 0 if denom <= 0 else (top * (track_h - thumb_h)) // denom
+        disp.fill_rect(126, track_y + off, 2, thumb_h, 1)
+
+
 def _menu_page_labels():
     """The (label, slug) pairs visible on the current page."""
     base = _menu_page * 6
@@ -567,33 +623,6 @@ def _provider():
     return _patch_provider
 
 
-def _patch_feedback():
-    """Toast the selected patch as "P3/16 Name" so PLAY always tells you where
-    you are — the header has no room for it and the REPL print is invisible."""
-    name = current_patch_name()
-    if not name:
-        return
-    idx = None
-    p = _provider()
-    if p is not None and hasattr(p, "current"):
-        try:
-            idx = p.current()
-        except Exception:
-            idx = None
-    total = None
-    if p is not None and hasattr(p, "count"):
-        try:
-            total = p.count()
-        except Exception:
-            total = None
-    if idx is not None and total:
-        toast("P%d/%d %s" % (idx + 1, total, name), 1000)
-    elif idx is not None:
-        toast("P%d %s" % (idx + 1, name), 1000)
-    else:
-        toast(name, 1000)
-
-
 def current_patch_name():
     p = _provider()
     if p is not None and hasattr(p, "name") and hasattr(p, "current"):
@@ -615,7 +644,6 @@ def set_patch(idx):
     # A newly selected patch owns its parameters: re-arm pot pickup so the
     # physical knob positions do not immediately overwrite it.
     _arm_pot_pickup()
-    _patch_feedback()
     _draw_ui(force=True)
 
 
@@ -626,7 +654,6 @@ def next_patch():
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index + 1)
     _arm_pot_pickup()
-    _patch_feedback()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -638,7 +665,6 @@ def prev_patch():
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index - 1)
     _arm_pot_pickup()
-    _patch_feedback()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -997,12 +1023,17 @@ def _handle_joystick_menu(jx, jy):
 
     # surface.joystick() reverses Y, so +1 = pushed away = "up".
     dy = _joy_axis(1, jy, now)
-    if dy and _menu_move_row(-dy):
-        changed = True
+    if dy:
+        if _menu_style() == "list":
+            if _menu_move(-dy):
+                changed = True
+        elif _menu_move_row(-dy):
+            changed = True
 
-    dx = _joy_axis(0, jx, now)
-    if dx and _menu_move(dx):
-        changed = True
+    if _menu_style() == "grid":
+        dx = _joy_axis(0, jx, now)
+        if dx and _menu_move(dx):
+            changed = True
 
     if changed:
         _draw_ui(force=True)
@@ -1154,7 +1185,11 @@ def _handle_event(ev):
                     play(name)
                 return
             if kind == "short_press":
-                if idx == BTN_OCTAVE_DOWN:
+                if _menu_style() == "list":
+                    step = -1 if idx in (BTN_OCTAVE_DOWN, BTN_PATCH_PREV) else 1
+                    if _menu_move(step):
+                        _draw_ui(force=True)
+                elif idx == BTN_OCTAVE_DOWN:
                     if _menu_move(-1):
                         _draw_ui(force=True)
                 elif idx == BTN_OCTAVE_UP:
@@ -1294,6 +1329,7 @@ def _settings_rows():
     # "locale" (stored key) vs "language" (label), so keep them explicit.
     return [
         ("locale", "choice", "language"),
+        ("menu_style", "choice", "menu_style"),
         ("midi_channel", "int", "midi_channel"),
         ("velocity", "int", "velocity"),
         ("octave", "int", "octave"),
@@ -1309,6 +1345,7 @@ def _settings_rows():
 # How each row is presented and what its value cycles through.
 _SETTINGS_CHOICES = {
     "locale": ("en", "ru"),
+    "menu_style": ("grid", "list"),
     "ble_name": ("CYNTHIA", "CYNTHIA-1", "MIDI"),
 }
 _SETTINGS_RANGE = {
@@ -1361,6 +1398,8 @@ def settings_value_text(key, value):
         return t("advertising")
     if key == "locale":
         return "Русский" if value == "ru" else "English"
+    if key == "menu_style":
+        return t("view_list") if value == "list" else t("view_grid")
     if key == "ble_midi_enabled":
         return t("ble_on") if value else t("ble_off")
     if key == "octave":
@@ -1872,6 +1911,10 @@ def _draw_ui(force=False):
     if _menu_active:
         # Only the 2x3 instrument grid; Settings is the separate bar below, so
         # a cursor on the Settings row must not also draw a cell highlight.
+        if _menu_style() == "list":
+            _draw_menu_list(disp)
+            disp.show()
+            return
         labels = _menu_page_labels()
         if _menu_row < SETTINGS_ROW:
             disp.draw_instrument_grid(labels, _menu_row, _menu_col)
