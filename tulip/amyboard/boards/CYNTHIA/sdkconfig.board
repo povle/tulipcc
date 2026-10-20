@@ -1,15 +1,27 @@
 # CYNTHIA SDK configuration
-# 16MB flash, octal PSRAM at 120MHz
-
+# 16MB flash, octal PSRAM.
+#
+# PSRAM/flash are pinned at 80MHz on purpose. IDF's own Kconfig says octal PSRAM
+# at 120MHz is EXPERIMENTAL and temperature-sensitive ("if your chip powers on
+# at a certain temperature ... accesses to/from PSRAM will crash randomly"), and
+# this board is repeatedly reflashed (so it runs warm). A marginal PSRAM timing
+# point shows up as a panic in early boot, before MicroPython starts, which is
+# exactly the class of failure we hit. 80MHz is the documented stable setting;
+# the cost is PSRAM bandwidth we are not close to saturating.
+#
+# CONFIG_IDF_EXPERIMENTAL_FEATURES is still needed for the octal PSRAM mode.
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_120M=y
-CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
-CONFIG_ESPTOOLPY_FLASHFREQ="120m"
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 CONFIG_ESPTOOLPY_OCT_FLASH=n
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="boards/CYNTHIA/tulip-partitions-16MB.csv"
+# The main task runs PSRAM + clock bring-up before MicroPython exists; pin a
+# little headroom instead of relying on the 3584-byte IDF default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
 # Enable FreeRTOS trace facility for uxTaskGetSystemState (used by compute_cpu_usage)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
