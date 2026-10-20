@@ -868,6 +868,11 @@ def _poll_body(tick):
     # Paint when something changed, or on a slow timer for values that drift on
     # their own (the battery readout). Replaces the old unconditional repaint
     # every 3rd poll, which resent an identical 1024-byte frame ~10x/sec.
+    # Expire a toast promptly: otherwise it would linger until the next forced
+    # repaint (up to _REFRESH_MS).
+    if _toast_text is not None and not _toast_active(now):
+        mark_dirty()
+
     if _pots_active and (_tick % 12) == 0:
         # Live bars: ~8Hz is plenty and keeps I2C traffic modest.
         mark_dirty()
@@ -1048,6 +1053,17 @@ def _handle_event(ev):
         if kind == "long_press" and idx == 4:
             # Long joystick press is the universal "back to BROWSER" (§7), so it
             # must also leave the settings app rather than stack menus.
+            # Long-press with the stick pushed DOWN = per-instrument panel.
+            # The stick's Y is otherwise unused (it sends CC1 as a mod wheel),
+            # and the centered long-press keeps opening the browser, so the two
+            # gestures cannot collide.
+            if not _pots_active:
+                joy = surface.joystick()
+                stick_down = joy is not None and joy[1] < 0.3
+                if stick_down and not (_menu_active or _settings_active
+                                       or _save_menu_active or _patch_list_active):
+                    open_pots()
+                    return
             if _pots_active:
                 close_pots()
             elif _save_menu_active:
@@ -1395,8 +1411,9 @@ def _draw_settings_ui(disp):
             val = ""
         else:
             val = settings_value_text(key, _settings.get(key))
-            val = disp.fit_text(display.FONT_5X7, val, 52)
-        vx = 126 - disp.str_width(display.FONT_5X7, val) if val else 126
+            val = disp.fit_text(display.FONT_5X7, val, 50)
+        # 123, not 126: the scrollbar occupies the last two columns.
+        vx = 123 - disp.str_width(display.FONT_5X7, val) if val else 123
 
         if sel:
             disp.fill_rect(0, y - 6, 128, line_h, 1)
@@ -1477,10 +1494,15 @@ def is_pots_active():
 
 
 def _draw_pots_ui(disp):
+    # Title line: "<instrument> POTS" so it reads as this instrument's params,
+    # with the patch name on the right when it fits.
     title = t("pots")
-    tw = disp.str_width(display.FONT_5X7, title)
-    disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 9, title, 1)
-    disp.hline(0, 11, 128, 1)
+    inst = (_name_label or _name or "CYNTHIA").upper()
+    left = disp.fit_text(display.FONT_4X6, inst, 70)
+    disp.draw_str(display.FONT_4X6, 2, 8, left, 1)
+    tw = disp.str_width(display.FONT_4X6, title)
+    disp.draw_str(display.FONT_4X6, 126 - tw, 8, title, 1)
+    disp.hline(0, 10, 128, 1)
 
     kn = surface.knobs()
     n = len(kn)
@@ -1595,7 +1617,10 @@ def _draw_save_menu_ui(disp):
 
     cur = _engine.get_patch_name() if _engine and hasattr(_engine, "get_patch_name") else "---"
     # The patch name itself is user content: never translated, only the label.
-    disp.draw_str(display.FONT_5X7, 2, 28, t("patch_name") + ": " + cur, 1)
+    # Clamped: a long user-typed name used to run off the panel.
+    line = t("patch_name") + ": " + str(cur)
+    disp.draw_str(display.FONT_5X7, 2, 28,
+                  disp.fit_text(display.FONT_5X7, line, 124), 1)
 
     btn_y, btn_w, btn_h = 40, 40, 14
     btn_gap = (128 - 2 * btn_w) // 3

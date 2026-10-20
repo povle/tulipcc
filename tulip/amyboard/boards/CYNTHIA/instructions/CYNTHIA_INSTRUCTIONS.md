@@ -554,7 +554,14 @@ caption. Instrument cells prefer FONT_TENTHINNERGUYS for short names and fall
 back to FONT_4X6 only for long or Cyrillic labels.
 
 Rows: Language, MIDI channel, Velocity, Octave, BLE MIDI (toggle), BLE Name,
-BLE Status (read-only), Joystick calibration (action), Back. Joystick vertical = move row, horizontal = change
+BLE Status (read-only), Pots (action), Joystick calibration (action), Back.
+
+**Pots / per-instrument panel.** `pots` in Settings, or **long-press the joystick
+button while the stick is pushed down**, opens a full-panel view of all 16 pots
+with live bars and their parameter names from the engine's `pot_name()`. A
+diagonal tick marks pots still waiting for pickup. Joystick-down is otherwise
+free (its Y also sends CC1 while playing), and a centred long-press still opens
+the browser, so the gestures do not collide. Joystick vertical = move row, horizontal = change
 value, short press = toggle/enter, long press = back to PLAY (universal back).
 Storage is `/user/settings.json` (`cynthia/settings.py`), written
 tmp-file-then-rename so a power cut cannot leave an empty config; every read
