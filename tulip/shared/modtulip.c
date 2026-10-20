@@ -757,6 +757,8 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_i2c_bg_errors_obj, tulip_i2c_bg_errors);
 extern void cynthia_get_knobs(float *out_knobs, uint8_t count);
 extern void cynthia_get_joystick(float *out_x, float *out_y, bool *out_btn);
 extern uint8_t cynthia_get_buttons(void);
+extern uint8_t cynthia_midi_tap_pop(uint8_t *out);
+extern uint32_t cynthia_midi_tap_dropped(void);
 extern bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind);
 extern int8_t cynthia_get_octave_shift(void);
 extern void cynthia_set_octave_shift(int8_t shift);
@@ -784,6 +786,8 @@ static inline void cynthia_get_joystick(float *out_x, float *out_y, bool *out_bt
     if (out_btn) *out_btn = false;
 }
 static inline uint8_t cynthia_get_buttons(void) { return 0; }
+static inline uint8_t cynthia_midi_tap_pop(uint8_t *out) { (void)out; return 0; }
+static inline uint32_t cynthia_midi_tap_dropped(void) { return 0; }
 static inline bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind) { return false; }
 static inline int8_t cynthia_get_octave_shift(void) { return 0; }
 static inline void cynthia_set_octave_shift(int8_t shift) {}
@@ -834,6 +838,24 @@ STATIC mp_obj_t tulip_cynthia_buttons(void) {
     return mp_obj_new_int(cynthia_get_buttons());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_buttons_obj, tulip_cynthia_buttons);
+
+STATIC mp_obj_t tulip_cynthia_midi_tap(void) {
+    // Drain the C input task's MIDI tap. Returns one message as bytes, or
+    // None when empty, so the Python poll can forward it to BLE-MIDI with no
+    // allocation beyond the message itself.
+    static uint8_t msg[3];
+    uint8_t n = cynthia_midi_tap_pop(msg);
+    if (n == 0) {
+        return mp_const_none;
+    }
+    return mp_obj_new_bytes(msg, n);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_midi_tap_obj, tulip_cynthia_midi_tap);
+
+STATIC mp_obj_t tulip_cynthia_midi_tap_dropped(void) {
+    return mp_obj_new_int_from_uint(cynthia_midi_tap_dropped());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_midi_tap_dropped_obj, tulip_cynthia_midi_tap_dropped);
 
 STATIC mp_obj_t tulip_cynthia_button_event(void) {
     uint8_t btn, kind;
@@ -2072,6 +2094,8 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_cynthia_joystick), MP_ROM_PTR(&tulip_cynthia_joystick_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_buttons), MP_ROM_PTR(&tulip_cynthia_buttons_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_button_event), MP_ROM_PTR(&tulip_cynthia_button_event_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_midi_tap), MP_ROM_PTR(&tulip_cynthia_midi_tap_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_midi_tap_dropped), MP_ROM_PTR(&tulip_cynthia_midi_tap_dropped_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_octave_shift), MP_ROM_PTR(&tulip_cynthia_octave_shift_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_status), MP_ROM_PTR(&tulip_cynthia_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_str_width), MP_ROM_PTR(&tulip_cynthia_str_width_obj) },

@@ -169,8 +169,8 @@ class SH1106:
         divider line at y=10.
         If joystick_xy is given, display "J: X.XX Y.XX" instead of battery.
         """
-        # Left: Octave
-        oct_str = "OCT:%+d" % octave
+        # Left: Octave. "+0" is noise; plain "0" at centre, signed otherwise.
+        oct_str = "OCT:%+d" % octave if octave else "OCT:0"
         self.draw_str(FONT_5X7, 2, 7, oct_str, 1)
 
         # Center: Instrument Name. resoledbold_tr is ASCII-only (its glyph table
@@ -178,10 +178,15 @@ class SH1106:
         # so a Cyrillic name would render as nothing at all. Fall back to the
         # bold Cyrillic face for any non-ASCII text instead of showing a blank.
         name_str = str(inst_name)
+        # The name shares the band with the octave (x=2..~42) and the battery
+        # (x=100..126); fitting it to 124px let a long name run straight through
+        # both. Budget the middle 54px and ellipsise instead.
+        NAME_W = 54
         if i18n.is_cyrillic(name_str):
-            name_str = self.fit_text(FONT_6X13B, name_str, 124)
+            name_str = self.fit_text(FONT_6X13B, name_str, NAME_W)
             name_font = FONT_6X13B
         else:
+            name_str = self.fit_text(FONT_RESOLEDBOLD, name_str, NAME_W)
             name_font = FONT_RESOLEDBOLD
         text_w = self.str_width(name_font, name_str)
         start_x = max(0, (WIDTH - text_w) // 2)

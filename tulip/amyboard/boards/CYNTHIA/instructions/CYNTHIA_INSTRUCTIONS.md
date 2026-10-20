@@ -600,6 +600,40 @@ Cyrillic rendering needed two things:
 that could be 0 — an infinite loop. It was unreachable while every font was
 ASCII-only; the Cyrillic faces make it live. Fixed to match u8g2.
 
+### 13.2b Pot pickup, input latency, and why controls went dead
+
+**Pot pickup.** Loading a patch applies its parameter values, and the next poll
+then fed the *physical* pot positions through `update_pot()` — overwriting them
+within a few frames. That is the "the settings change on startup" report. A pot
+is now *unarmed* after every instrument/patch change and its position is ignored
+until it moves more than `PICKUP_EPS` (3%) from the value it held at load time.
+`_arm_pot_pickup()` must be called **after** `surface.start()` (which resets the
+cached knob array), or the baseline is captured as zeros.
+
+**Pot scan rate.** One pot per input-task iteration, at a 2 ms ADS conversion
+plus a 5 ms loop delay, meant a 16-pot sweep of ~112 ms — **9 Hz per pot**, which
+is what "the knobs are sluggish" actually measured. Now 2 pots per iteration with
+a 1 ms delay: ~46 ms per sweep (~21 Hz/pot), while the key scan still runs every
+~6 ms.
+
+**Controls going dead.** `attach_current()` returned early when no sketch was
+imported, which left the poll stopped: no button scanning, no knob routing, no
+display refresh and no watchdog feed. The panel still showed the last frame, so
+the board looked alive while every control was inert. It now always starts the
+poll and paints a generic UI when there is no engine.
+
+**Swallowed button presses.** Octave−/Octave+ long-press had no function, so a
+press that ran past the 800 ms threshold did nothing at all. It is demoted to a
+normal press (except during the calibration chord, where both are held on
+purpose). The button event queue is 32 deep so a burst cannot drop silently.
+
+**Menu reachability and paging.** The cursor is now a single selection index
+(`_menu_sel`) with row/col/page derived from it. Rows with no instruments are
+skipped, so Settings is reachable with a single instrument (previously stepping
+onto an empty row clamped the cursor back). More than 6 instruments **page**
+instead of silently disappearing; left/right walks every slot, and a page change
+shows `n/pages`.
+
 ### 13.3 BLE-MIDI (port of the original `InstrumentBLE.cpp`)
 
 `cynthia/ble_midi.py` advertises the standard BLE-MIDI service
@@ -617,6 +651,14 @@ host write --> parse --> tulip.midi_local() --> AMY
 ```
 
 `cynthia/midi.py` gained `add_forwarder/remove_forwarder` for that tap.
+
+**The 28 keys do NOT go through that bus.** They are scanned and injected in
+`cynthia_input.c` (`midi_local()`), so the Python forwarder never saw a note and
+BLE transmitted joystick/pot traffic but no keys at all. `cynthia_input.c` now
+also pushes every injected message into a 64-entry ring
+(`cynthia_midi_tap_pop()`), exposed as `tulip.cynthia_midi_tap()`; the UI poll
+drains it and calls `ble_midi.forward()`. If BLE ever goes silent for notes
+specifically, check that drain first.
 
 **Two build-system gates, both of which silently disabled BLE.** If BLE ever
 stops working after a submodule bump, check these first:

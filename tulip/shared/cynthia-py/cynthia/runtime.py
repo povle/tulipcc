@@ -28,7 +28,7 @@ import sys
 import time
 import tulip
 
-from . import surface, midi, display, i18n
+from . import surface, midi, display, i18n, ble_midi as _ble_mod
 from .i18n import t
 
 # Button indices within spark_main's control-button events (§10.1).
@@ -59,6 +59,46 @@ _POT_NAME_KEYS = [
     "resonance", "attack", "decay", "sustain",
     "release", "delay", "delay_t", "glide",
 ]
+
+
+# --- Pot pickup ------------------------------------------------------------
+# A pot is "armed" once it has physically moved away from where it sat when the
+# current patch/instrument was loaded. Until then its position is IGNORED.
+#
+# Without this, every patch load was silently corrupted: the patch's parameters
+# were applied, and then the next poll fed the physical pot positions through
+# update_pot(), overwriting them. The visible symptom was "the settings change
+# on startup" — a pot sitting anywhere but the patch's own value clamped the
+# sound back to the knob position within a few polls. (The C side prescans pots
+# at init to avoid a 0.5→real ramp, but EMA settling still produced "changes"
+# right after boot.)
+#
+# This is the standard synth answer: ignore absolute positions until the player
+# turns the control, then let it take over.
+PICKUP_EPS = 0.03
+_pot_armed = [True] * 16
+_pot_base = [0.0] * 16
+_pot_count = 16
+
+
+def _arm_pot_pickup():
+    """Re-arm pickup: current pot positions become the do-not-touch baseline."""
+    global _pot_armed, _pot_base, _pot_count
+    try:
+        v = surface.knobs()
+        _pot_count = len(v)
+        _pot_base = list(v)
+        _pot_armed = [False] * _pot_count
+    except Exception:
+        _pot_count = 0
+        _pot_base = []
+        _pot_armed = []
+
+
+def pot_pickup_state():
+    """[(armed, position)] — for diagnostics / a pot-map screen."""
+    return list(zip(_pot_armed, _pot_base))
+
 
 # --- User patch system (§12) ---
 
@@ -166,8 +206,12 @@ _tick = 0
 _running = False
 _patch_provider = None  # §12 provider (engine or sketch-supplied)
 _menu_active = False
-_menu_row = 0
-_menu_col = 0
+# One source of truth: the selection index. Row/col/page are derived from it
+# (_menu_sync_from_sel), which is what lets the grid page past 6 instruments.
+_menu_sel = 0             # 0..n-1 instruments, n = Settings bar
+_menu_row = 0             # derived
+_menu_col = 0             # derived
+_menu_page = 0            # derived
 _menu_insts = []          # folder slugs (what play() takes)
 _menu_labels = []         # friendly names for display (meta.json)
 _menu_last_sel = 0
@@ -181,65 +225,112 @@ SETTINGS_ROW = 2
 _menu_includes_settings = True
 _name_label = None   # friendly display name for the header (meta.json)
 
-def _menu_selected_index():
-    """Index into _menu_insts for the cursor's cell, or None if the cell is empty.
+def _menu_page_count():
+    """Pages of 6 instrument cells (the grid is 2x3)."""
+    n = len(_menu_insts)
+    return (n + 5) // 6 if n else 1
 
-    The grid is a fixed 2x3, but the library is usually smaller, so most cells
-    are empty. Without this, pressing on an empty cell did nothing at all and the
-    menu looked broken. The Settings bar sits at index len(_menu_insts) and is
-    returned as SETTINGS_SLOT instead of an instrument index.
+
+def _menu_sel_count():
+    """Total selectable slots: instruments plus the Settings bar."""
+    return len(_menu_insts) + (1 if _menu_includes_settings else 0)
+
+
+def _menu_sync_from_sel():
+    """Derive row/col/page from the single selection index."""
+    global _menu_row, _menu_col, _menu_page
+    n = len(_menu_insts)
+    if _menu_includes_settings and _menu_sel >= n:
+        _menu_row = SETTINGS_ROW
+        _menu_col = 0
+        _menu_page = max(0, (n - 1) // 6) if n else 0
+    else:
+        i = _menu_sel if _menu_sel >= 0 else 0
+        _menu_page = i // 6
+        local = i % 6
+        _menu_row = local // 3
+        _menu_col = local % 3
+
+
+def _menu_set_sel(idx):
+    """Select `idx` (instrument index, or len(_menu_insts) = Settings)."""
+    global _menu_sel
+    n = _menu_sel_count()
+    if n <= 0:
+        return False
+    new = idx
+    if new < 0:
+        new = 0
+    elif new >= n:
+        new = n - 1
+    if new == _menu_sel:
+        return False
+    old_page = _menu_page
+    _menu_sel = new
+    _menu_sync_from_sel()
+    if _menu_page != old_page:
+        # Paging is otherwise invisible on a 2x3 grid with no spare pixels;
+        # say where we landed instead of silently swapping the contents.
+        toast("%d/%d" % (_menu_page + 1, _menu_page_count()), 700)
+    return True
+
+
+def _menu_move(delta):
+    """Move the selection by `delta` slots (1 = right, -1 = left)."""
+    return _menu_set_sel(_menu_sel + delta)
+
+
+def _menu_move_row(delta):
+    """Move up/down one grid row (3 slots), skipping rows without instruments.
+
+    Only rows that actually contain an instrument are reachable, plus the
+    Settings bar. This is what makes Settings accessible with a single
+    instrument: stepping onto an empty row used to clamp the cursor straight
+    back, so the bar could never be reached.
     """
-    if _menu_includes_settings and _menu_row == SETTINGS_ROW:
+    n = len(_menu_insts)
+    if _menu_includes_settings and _menu_sel >= n:
+        # On Settings: up lands on the last instrument row of this page.
+        if not n:
+            return False
+        base = _menu_page * 6
+        return _menu_set_sel(min(n - 1, base + 5))
+    target = _menu_sel + 3 * delta
+    if delta > 0:
+        # Downward: if the target row has no instrument on this page, the only
+        # thing below is the Settings bar.
+        avail = n - _menu_page * 6
+        if target >= n or ((target % 6) // 3 == 1 and (target % 6) >= avail):
+            return _menu_set_sel(n) if _menu_includes_settings else False
+    elif target < 0:
+        return _menu_set_sel(0)
+    return _menu_set_sel(target)
+
+
+def _menu_selected_index():
+    """Instrument index under the cursor, SETTINGS_SLOT on the bar, or None."""
+    if _menu_includes_settings and _menu_sel >= len(_menu_insts):
         return SETTINGS_SLOT
-    idx = _menu_row * 3 + _menu_col
-    return idx if idx < len(_menu_insts) else None
+    return _menu_sel if _menu_sel < len(_menu_insts) else None
 
 
-def _menu_slot_count():
-    """Selectable instrument slots (the Settings bar is its own row)."""
-    return len(_menu_insts)
-
-
-def _menu_cursor_slot():
-    """Cursor position as an instrument slot index, or len(_menu_insts) on Settings."""
-    if _menu_includes_settings and _menu_row == SETTINGS_ROW:
-        return len(_menu_insts)
-    return _menu_row * 3 + _menu_col
-
-
-def _menu_max_row():
-    return SETTINGS_ROW if _menu_includes_settings else 1
+def _menu_page_labels():
+    """The (label, slug) pairs visible on the current page."""
+    base = _menu_page * 6
+    return _menu_labels[base:base + 6]
 
 
 def _menu_cursor_to_last():
-    """Clamp the cursor to a real slot (after the list changes)."""
-    global _menu_row, _menu_col
+    """Restore the remembered selection (an instrument index or Settings)."""
+    global _menu_sel
     n = len(_menu_insts)
-    if n <= 0:
-        # No instruments: land on Settings if it exists, else the first cell.
-        _menu_row = SETTINGS_ROW if _menu_includes_settings else 0
-        _menu_col = 0
-        return
-    # _menu_last_sel is either an instrument index or SETTINGS_SLOT, so that
-    # reopening the menu after using Settings returns you to Settings rather
-    # than snapping to the last instrument.
     if _menu_last_sel == SETTINGS_SLOT and _menu_includes_settings:
-        _menu_row = SETTINGS_ROW
-        _menu_col = 0
-        return
-    idxi = _menu_last_sel if isinstance(_menu_last_sel, int) else 0
-    idx = min(max(idxi, 0), n - 1)
-    if idx >= 3:
-        _menu_row = 1
-        _menu_col = idx - 3
+        _menu_sel = n
+    elif isinstance(_menu_last_sel, int):
+        _menu_sel = min(max(_menu_last_sel, 0), max(0, n - 1))
     else:
-        _menu_row = 0
-        _menu_col = idx
-
-
-def _menu_slot_is_settings(idx):
-    return _menu_includes_settings and idx == len(_menu_insts)
-
+        _menu_sel = 0
+    _menu_sync_from_sel()
 
 def open_menu():
     global _menu_active, _menu_row, _menu_col, _menu_insts, _menu_labels
@@ -298,6 +389,15 @@ def play(name):
             print("   ", n)
         return False
 
+    # Show something before the blocking stop/import: otherwise the previous
+    # instrument's UI freezes and then snaps, with no sign anything is happening.
+    try:
+        from . import browser as _br0
+        toast("%s %s" % (t("loading"), _br0._meta_name(name)), 1500)
+        _draw_ui(force=True)
+    except Exception:
+        pass
+
     stop()
 
     print("cynthia: loading %s..." % name)
@@ -318,12 +418,12 @@ def play(name):
     _engine = None
     _patch_provider = None
     if _sketch_mod is not None:
-        if hasattr(_sketch_mod, "cynthia_instrument"):
+        if _sketch_mod is not None and hasattr(_sketch_mod, "cynthia_instrument"):
             try:
                 _engine = _sketch_mod.cynthia_instrument()
             except Exception as e:
                 print("cynthia: cynthia_instrument() failed:", e)
-        if hasattr(_sketch_mod, "cynthia_patches"):
+        if _sketch_mod is not None and hasattr(_sketch_mod, "cynthia_patches"):
             try:
                 _patch_provider = _sketch_mod.cynthia_patches()
             except Exception:
@@ -341,6 +441,10 @@ def play(name):
     _running = True
     _tick = 0
     surface.start()
+    # AFTER surface.start(): it resets the cached knob array, so arming before
+    # this would snapshot zeros as the baseline and every real position would
+    # look like a movement.
+    _arm_pot_pickup()
     _start_poll()
 
     pname = current_patch_name()
@@ -370,8 +474,12 @@ def attach_current(name):
     global _engine, _sketch_mod, _name, _running, _patch_provider, _tick
 
     _sketch_mod = _current_sketch()
-    if _sketch_mod is None:
-        return False
+    # Do NOT bail out when there is no sketch. Returning here left the poll
+    # stopped, which means no button scanning, no knob routing, no display
+    # refresh and no watchdog feed — the board looked alive (last frame still on
+    # screen) but every control was dead. A failed import or safe mode is
+    # exactly when the UI must keep running so the user can pick another
+    # instrument.
     _engine = None
     _patch_provider = None
     if hasattr(_sketch_mod, "cynthia_instrument"):
@@ -391,9 +499,14 @@ def attach_current(name):
     _running = True
     _tick = 0
     surface.start()
+    _arm_pot_pickup()
     _start_poll()
     if name is None:
         print("cynthia: no instrument attached (no engine; UI stays generic)")
+        # Paint the generic UI (header + brand) so the panel shows a live state
+        # instead of a stale frame from the previous boot.
+        toast(t("no_instrument"), 2500)
+        _draw_ui(force=True)
         return False
     print("cynthia: attached to %s%s" % (name, (" — patch: " + current_patch_name()) if current_patch_name() else ""))
     _draw_ui(force=True)
@@ -441,6 +554,33 @@ def _provider():
     return _patch_provider
 
 
+def _patch_feedback():
+    """Toast the selected patch as "P3/16 Name" so PLAY always tells you where
+    you are — the header has no room for it and the REPL print is invisible."""
+    name = current_patch_name()
+    if not name:
+        return
+    idx = None
+    p = _provider()
+    if p is not None and hasattr(p, "current"):
+        try:
+            idx = p.current()
+        except Exception:
+            idx = None
+    total = None
+    if p is not None and hasattr(p, "count"):
+        try:
+            total = p.count()
+        except Exception:
+            total = None
+    if idx is not None and total:
+        toast("P%d/%d %s" % (idx + 1, total, name), 1000)
+    elif idx is not None:
+        toast("P%d %s" % (idx + 1, name), 1000)
+    else:
+        toast(name, 1000)
+
+
 def current_patch_name():
     p = _provider()
     if p is not None and hasattr(p, "name") and hasattr(p, "current"):
@@ -459,6 +599,10 @@ def set_patch(idx):
         p.select(idx)
     elif _engine is not None and hasattr(_engine, "set_patch"):
         _engine.set_patch(idx)
+    # A newly selected patch owns its parameters: re-arm pot pickup so the
+    # physical knob positions do not immediately overwrite it.
+    _arm_pot_pickup()
+    _patch_feedback()
     _draw_ui(force=True)
 
 
@@ -468,6 +612,8 @@ def next_patch():
         p.select((p.current() + 1) % p.count())
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index + 1)
+    _arm_pot_pickup()
+    _patch_feedback()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -478,6 +624,8 @@ def prev_patch():
         p.select((p.current() - 1) % p.count())
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index - 1)
+    _arm_pot_pickup()
+    _patch_feedback()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -522,6 +670,87 @@ def _start_poll():
     _arm_watchdog()
 
 
+# --- transient on-screen message -----------------------------------------
+# Lots of actions used to be REPL-only (patch change, save, BLE connect, octave
+# limits), which on a headless synth means "nothing happened". A toast is the
+# single place that turns those into visible feedback.
+_toast_text = None
+_toast_until = 0
+
+
+def toast(text, ms=1200):
+    """Show `text` centred in the content area for `ms` milliseconds."""
+    global _toast_text, _toast_until
+    _toast_text = text
+    _toast_until = time.ticks_add(time.ticks_ms(), ms)
+    mark_dirty()
+
+
+def _toast_active(now=None):
+    global _toast_text
+    if _toast_text is None:
+        return False
+    if now is None:
+        now = time.ticks_ms()
+    if time.ticks_diff(now, _toast_until) >= 0:
+        _toast_text = None
+        return False
+    return True
+
+
+def _draw_toast(disp):
+    """Inverted band across the content area with the message centred."""
+    text = disp.fit_text(display.FONT_5X7, _toast_text, 120)
+    w = disp.str_width(display.FONT_5X7, text)
+    y = 26
+    disp.fill_rect(0, y, 128, 14, 1)
+    disp.draw_str(display.FONT_5X7, max(1, (128 - w) // 2), y + 10, text, 0)
+
+
+_last_ble_seq = 0
+_low_batt_at = 0
+
+
+def _poll_notices(now):
+    """Rare, cheap notifications: BLE link up, battery low."""
+    global _last_ble_seq, _low_batt_at
+    try:
+        seq = _ble_mod.connection_seq()
+        if seq != _last_ble_seq:
+            _last_ble_seq = seq
+            if seq:
+                toast(t("ble_connected"), 1200)
+    except Exception:
+        pass
+    # Low battery: only when the hardware reports it, and at most every 30s.
+    if hasattr(tulip, "cynthia_battery_voltage"):
+        try:
+            v = tulip.cynthia_battery_voltage()
+        except Exception:
+            v = None
+        if v is not None and v < 3.5 and v > 2.0:
+            if time.ticks_diff(now, _low_batt_at) >= 30000:
+                _low_batt_at = now
+                toast("%s %.2fV" % (t("low_battery"), v), 1500)
+
+
+def _drain_midi_tap():
+    """Move C-injected MIDI events to the BLE forwarder. No-op when BLE is off."""
+    if not hasattr(tulip, "cynthia_midi_tap"):
+        return
+    _ble = _ble_mod
+    if not _ble.is_connected():
+        # Still drain, otherwise the ring fills and new events are dropped
+        # while disconnected; nothing to forward to though.
+        while tulip.cynthia_midi_tap() is not None:
+            pass
+        return
+    msg = tulip.cynthia_midi_tap()
+    while msg is not None:
+        _ble.forward(msg)
+        msg = tulip.cynthia_midi_tap()
+
+
 def _poll(tick):
     """One UI poll. MUST NOT raise: a scheduled callback that throws is swallowed
     by the VM, which silently kills every later poll — keys keep playing (they are
@@ -564,11 +793,25 @@ def _poll_body(tick):
     # Route pot movements to the engine (§9.2 -> instrument params).
     if _engine is not None and hasattr(_engine, "update_pot"):
         for ch, v in surface.knob_changes():
+            # Pickup: a freshly loaded patch owns its parameters until the
+            # player actually moves this control.
+            if ch < len(_pot_armed) and not _pot_armed[ch]:
+                d = v - _pot_base[ch]
+                if d < 0:
+                    d = -d
+                if d < PICKUP_EPS:
+                    continue
+                _pot_armed[ch] = True
             _engine.update_pot(ch, v)
             # Record for the param-name overlay.
             _last_knob_ch = ch
             _last_knob_time = now
             mark_dirty()
+
+    # Forward MIDI that the C input task injected directly (the 28 keys).
+    # Those bypass cynthia.midi.inject(), so the BLE forwarder never sees them
+    # and the host received joystick/pot traffic but no notes at all.
+    _drain_midi_tap()
 
     # Joystick → MIDI pitch bend (X axis) + modulation (Y axis), C++ style.
     joy = surface.joystick()
@@ -625,6 +868,12 @@ def _poll_body(tick):
     # Paint when something changed, or on a slow timer for values that drift on
     # their own (the battery readout). Replaces the old unconditional repaint
     # every 3rd poll, which resent an identical 1024-byte frame ~10x/sec.
+    if _pots_active and (_tick % 12) == 0:
+        # Live bars: ~8Hz is plenty and keeps I2C traffic modest.
+        mark_dirty()
+
+    _poll_notices(now)
+
     _tick += 1
     if _dirty or (_REFRESH_MS and time.ticks_diff(now, _last_paint_ms) >= _REFRESH_MS):
         _draw_ui()
@@ -683,49 +932,20 @@ def _joy_reset():
 
 
 def _handle_joystick_menu(jx, jy):
-    """Step the grid cursor: up/down = row, left/right = column."""
-    global _menu_row, _menu_col
+    """Step the grid cursor: up/down = row, left/right = slot (pages included)."""
     now = time.ticks_ms()
     changed = False
 
     # surface.joystick() reverses Y, so +1 = pushed away = "up".
     dy = _joy_axis(1, jy, now)
-    if dy:
-        new_row = _menu_row - dy
-        if new_row < 0:
-            new_row = 0
-        elif new_row > _menu_max_row():
-            new_row = _menu_max_row()
-        if new_row != _menu_row:
-            _menu_row = new_row
-            changed = True
+    if dy and _menu_move_row(-dy):
+        changed = True
 
     dx = _joy_axis(0, jx, now)
-    if dx:
-        new_col = _menu_col + dx
-        if new_col < 0:
-            new_col = 0
-        elif new_col > 2:
-            new_col = 2
-        if new_col != _menu_col:
-            _menu_col = new_col
-            changed = True
+    if dx and _menu_move(dx):
+        changed = True
 
     if changed:
-        # Never leave the cursor on an empty cell: a 2x3 grid with 2 instruments
-        # would otherwise let the joystick park on a blank square where pressing
-        # does nothing. Snap to the nearest real instrument (the Settings bar is
-        # always real).
-        n = len(_menu_insts)
-        if _menu_row != SETTINGS_ROW or not _menu_includes_settings:
-            idx = _menu_row * 3 + _menu_col
-            if n == 0:
-                _menu_row = SETTINGS_ROW if _menu_includes_settings else 0
-                _menu_col = 0
-            elif idx >= n:
-                idx = n - 1
-                _menu_row = 1 if idx >= 3 else 0
-                _menu_col = idx % 3
         _draw_ui(force=True)
 
 
@@ -768,6 +988,15 @@ def _handle_joystick_patch_list(jx, jy):
         _draw_ui(force=True)
 
 
+def _octave_feedback(before, after):
+    """Show the new octave, and say so when it is already at the limit."""
+    if after == before and abs(after) >= 4:
+        toast(t("oct_limit"), 900)
+    else:
+        toast("%s %+d" % (t("oct"), after), 700)
+    print("cynthia: octave", after)
+
+
 def _check_calibration_chord(now):
     """Start calibration when Octave- and Octave+ are held together 5s."""
     global _chord_start
@@ -801,11 +1030,31 @@ def _handle_event(ev):
 
     if ev[0] == "button":
         _, idx, kind = ev
+        if _pots_active:
+            # Any button leaves the read-only pots screen.
+            close_pots()
+            return
+        # Octave buttons have no long-press function (the slot is reserved and
+        # unused), so a hold was silently doing NOTHING — which reads as "the
+        # button randomly doesn't work" whenever a press ran a little past the
+        # 800ms threshold. Demote it to a normal press.
+        if kind == "long_press" and idx in (BTN_OCTAVE_DOWN, BTN_OCTAVE_UP):
+            # ...unless the 5s calibration chord is in progress, in which case
+            # both octave buttons are held on purpose and must not shift octaves.
+            if _chord_start is not None:
+                return
+            kind = "short_press"
         # Long-press on joystick button (idx 4) opens menu (C++ System.cpp)
         if kind == "long_press" and idx == 4:
             # Long joystick press is the universal "back to BROWSER" (§7), so it
             # must also leave the settings app rather than stack menus.
-            if _settings_active:
+            if _pots_active:
+                close_pots()
+            elif _save_menu_active:
+                _close_save_menu()
+            elif _patch_list_active:
+                _toggle_patch_list()
+            elif _settings_active:
                 close_settings()
             elif _menu_active:
                 close_menu()
@@ -836,19 +1085,17 @@ def _handle_event(ev):
                 return
             if kind == "short_press":
                 if idx == BTN_OCTAVE_DOWN:
-                    _menu_col = max(0, _menu_col - 1)
-                    _draw_ui(force=True)
+                    if _menu_move(-1):
+                        _draw_ui(force=True)
                 elif idx == BTN_OCTAVE_UP:
-                    _menu_col = min(2, _menu_col + 1)
-                    _draw_ui(force=True)
+                    if _menu_move(1):
+                        _draw_ui(force=True)
                 elif idx == BTN_PATCH_PREV:
-                    _menu_row = max(0, _menu_row - 1)
-                    _menu_col = min(_menu_col, 2)
-                    _draw_ui(force=True)
+                    if _menu_move_row(-1):
+                        _draw_ui(force=True)
                 elif idx == BTN_PATCH_NEXT:
-                    _menu_row = min(_menu_max_row(), _menu_row + 1)
-                    _menu_col = min(_menu_col, 2)
-                    _draw_ui(force=True)
+                    if _menu_move_row(1):
+                        _draw_ui(force=True)
             return
 
         if _save_menu_active:
@@ -938,13 +1185,13 @@ def _handle_event(ev):
         if kind != "short_press":
             return
         if idx == BTN_OCTAVE_DOWN:
-            midi.octave_shift(midi.octave_shift() - 1)
-            print("cynthia: octave", midi.octave_shift())
-            _draw_ui(force=True)
+            before = midi.octave_shift()
+            now_oct = midi.octave_shift(before - 1)
+            _octave_feedback(before, now_oct)
         elif idx == BTN_OCTAVE_UP:
-            midi.octave_shift(midi.octave_shift() + 1)
-            print("cynthia: octave", midi.octave_shift())
-            _draw_ui(force=True)
+            before = midi.octave_shift()
+            now_oct = midi.octave_shift(before + 1)
+            _octave_feedback(before, now_oct)
         elif idx == BTN_PATCH_PREV:
             print("cynthia: patch", prev_patch())
         elif idx == BTN_PATCH_NEXT:
@@ -983,6 +1230,7 @@ def _settings_rows():
         ("ble_midi_enabled", "toggle", "ble_midi"),
         ("ble_name", "choice", "ble_name"),
         ("ble_status", "info", "ble_status"),
+        ("pots", "action", "pots"),
         ("calibrate", "action", "calibrate"),
         ("back", "back", "back"),
     ]
@@ -1028,7 +1276,7 @@ def settings_value_text(key, value):
     if key == "ble_status":
         # Read-only row: shows what the radio is actually doing, so a silent
         # pairing failure is visible instead of looking like a dead toggle.
-        from . import ble_midi as _ble
+        _ble = _ble_mod
         st = _ble.status()
         if not _ble.is_available():
             return "n/a"
@@ -1061,6 +1309,10 @@ def _settings_step(key, kind, delta):
     if kind == "info":
         return
     if kind == "action":
+        if key == "pots":
+            close_settings()
+            open_pots()
+            return
         if key == "calibrate":
             # Leave the settings screen first: calibration owns the display and
             # must not have a menu repaint fighting it.
@@ -1099,7 +1351,7 @@ def _settings_step(key, kind, delta):
         # MIDI bus, and stop() unhooks the tap. The radio stack itself is
         # compiled in at boot, which is the part that needs a reboot (to change
         # that you would reflash), not the advertising.
-        from . import ble_midi as _ble
+        _ble = _ble_mod
         if new:
             if _ble.start(name=_settings.get("ble_name")):
                 print("cynthia: BLE MIDI enabled")
@@ -1156,11 +1408,16 @@ def _draw_settings_ui(disp):
             if val:
                 disp.draw_str(display.FONT_5X7, vx, y, val, 1)
 
-    # Scroll indicators: something above / below the visible window.
-    if _settings_scroll > 0:
-        disp.draw_str(display.FONT_4X6, 120, 24, "^", 1)
-    if _settings_scroll + visible < len(rows):
-        disp.draw_str(display.FONT_4X6, 120, 63, "v", 1)
+    # Scrollbar on the right edge. Text glyphs here used to overlap the last
+    # row's value (both were drawn around y=60..63); a 2px bar never collides.
+    total = len(rows)
+    if total > visible:
+        track_y, track_h = 22, 40
+        disp.rect(126, track_y, 2, track_h, 1)
+        thumb_h = max(4, (visible * track_h) // total)
+        denom = total - visible
+        off = 0 if denom <= 0 else (_settings_scroll * (track_h - thumb_h)) // denom
+        disp.fill_rect(126, track_y + off, 2, thumb_h, 1)
 
 
 def _handle_joystick_settings(jx, jy):
@@ -1193,6 +1450,75 @@ def _handle_joystick_settings(jx, jy):
 
     if changed:
         _draw_ui(force=True)
+
+
+# --- Pots app --------------------------------------------------------------
+# 16 physical pots, no on-screen map: the only way to learn which knob is
+# "Custom 3" was to turn each one. This lists them with live bars, and shows
+# which pots are still waiting for pickup (so a patch's parameters are safe).
+_pots_active = False
+
+
+def open_pots():
+    global _pots_active
+    _pots_active = True
+    _joy_reset()
+    _draw_ui(force=True)
+
+
+def close_pots():
+    global _pots_active
+    _pots_active = False
+    _draw_ui(force=True)
+
+
+def is_pots_active():
+    return _pots_active
+
+
+def _draw_pots_ui(disp):
+    title = t("pots")
+    tw = disp.str_width(display.FONT_5X7, title)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 9, title, 1)
+    disp.hline(0, 11, 128, 1)
+
+    kn = surface.knobs()
+    n = len(kn)
+    if n > 16:
+        n = 16
+    # Two columns of 8 rows, 6px each: y = 14..62.
+    for i in range(n):
+        col = i // 8
+        row = i % 8
+        x = col * 64
+        y = 14 + row * 6
+        # Param name: the engine's own label when it has one, else the
+        # universal standard-pot name.
+        if _engine is not None and hasattr(_engine, "pot_name"):
+            try:
+                name = _engine.pot_name(i)
+            except Exception:
+                name = None
+        else:
+            name = None
+        if not name:
+            k = _POT_NAME_KEYS[i] if i < len(_POT_NAME_KEYS) else None
+            name = t(k) if k else "Ch%d" % (i + 1)
+        armed = i < len(_pot_armed) and _pot_armed[i]
+        # Unarmed pots are waiting for pickup: mark them so the user knows why
+        # turning this pot has not changed the sound yet.
+        label = disp.fit_text(display.FONT_4X6, name, 34)
+        disp.draw_str(display.FONT_4X6, x + 2, y + 5, label, 1)
+        # Bar
+        bx, bw = x + 38, 24
+        disp.rect(bx, y, bw, 5, 1)
+        w = int((bw - 2) * max(0.0, min(1.0, kn[i])))
+        if w > 0:
+            disp.fill_rect(bx + 1, y + 1, w, 3, 1)
+        if not armed:
+            # A single diagonal tick in the corner = "not captured yet".
+            disp.pixel(bx + bw - 2, y + 1, 1)
+            disp.pixel(bx + bw - 3, y + 2, 1)
 
 
 # --- Patch save/load UI helpers ---
@@ -1255,6 +1581,7 @@ def _do_save_current_patch():
     pname = _engine.get_patch_name() if hasattr(_engine, "get_patch_name") else "Patch %d" % idx
     if save_patch(_name, idx, pname, state):
         print("cynthia: patch saved as %s/%d.json (%s)" % (_name, idx, pname))
+        toast(t("saved"), 1200)
         return idx
     print("cynthia: save failed")
     return None
@@ -1396,6 +1723,13 @@ def _draw_ui(force=False):
         return
     disp.fill(0)
 
+    # The pots screen is a full-panel view (it draws its own title), so it must
+    # not sit under the normal header.
+    if _pots_active:
+        _draw_pots_ui(disp)
+        disp.show()
+        return
+
     # Always draw header (C++ _drawHeader before everything).
     # Prefer the instrument's friendly name from meta.json ("Juno-106") over the
     # folder slug ("juno") — the REPL menu already shows the friendly one, so the
@@ -1403,7 +1737,9 @@ def _draw_ui(force=False):
     # header.
     _lbl = _name_label or _name or "CYNTHIA"
     inst_title = _lbl.upper()
-    inst_title = disp.fit_text(display.FONT_RESOLEDBOLD, inst_title, 124)
+    # Same 54px budget as draw_header: the band is shared with the param name
+    # and the percentage, so a long name would run through both.
+    inst_title = disp.fit_text(display.FONT_RESOLEDBOLD, inst_title, 54)
     global _last_joy
 
     # Check if we should show a knob-change overlay (500ms persist).
@@ -1430,7 +1766,15 @@ def _draw_ui(force=False):
         text_w = disp.str_width(display.FONT_RESOLEDBOLD, inst_title)
         start_x = max(0, (display.WIDTH - text_w) // 2)
         disp.draw_str(display.FONT_RESOLEDBOLD, start_x, 7, inst_title, 1)
-        disp.hline(0, 10, display.WIDTH, 1)
+        # A one-pixel bar under the row: a percentage alone does not show where
+        # the knob sits; this makes a sweep readable at a glance.
+        if _last_knob_ch < len(kn):
+            bw = int(126 * max(0.0, min(1.0, kn[_last_knob_ch])))
+            disp.hline(0, 10, display.WIDTH, 1)
+            if bw > 0:
+                disp.fill_rect(1, 9, bw, 1, 1)
+        else:
+            disp.hline(0, 10, display.WIDTH, 1)
     else:
         # Normal header: battery voltage, not joystick
         batt_v = None
@@ -1439,13 +1783,20 @@ def _draw_ui(force=False):
         disp.draw_header(octave=midi.octave_shift(), inst_name=inst_title,
                          battery_v=batt_v)
 
+    if _toast_active() and not (_menu_active or _settings_active
+                                or _save_menu_active or _patch_list_active):
+        _draw_toast(disp)
+        disp.show()
+        return
+
     if _menu_active:
         # Only the 2x3 instrument grid; Settings is the separate bar below, so
         # a cursor on the Settings row must not also draw a cell highlight.
+        labels = _menu_page_labels()
         if _menu_row < SETTINGS_ROW:
-            disp.draw_instrument_grid(_menu_labels, _menu_row, _menu_col)
+            disp.draw_instrument_grid(labels, _menu_row, _menu_col)
         else:
-            disp.draw_instrument_grid(_menu_labels, -1, -1)
+            disp.draw_instrument_grid(labels, -1, -1)
         disp.draw_app_bar(t("settings"), selected=(_menu_row == SETTINGS_ROW))
         disp.show()
         return

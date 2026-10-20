@@ -66,6 +66,9 @@ _state = {
     "error": None,
     "sent": 0,
     "received": 0,
+    # Bumped on every successful connection, so the UI can notice a new link
+    # without polling the whole status dict (which allocates) each frame.
+    "conn_seq": 0,
 }
 
 _ble = None
@@ -77,6 +80,16 @@ _irq_set = False
 def status():
     """Snapshot for the settings screen / REPL diagnostics."""
     return dict(_state)
+
+
+def is_connected():
+    """Cheap bool: avoid building a status dict on every UI poll."""
+    return _state["connected"]
+
+
+def connection_seq():
+    """Cheap counter: changes when a central connects."""
+    return _state["conn_seq"]
 
 
 def is_available():
@@ -149,6 +162,7 @@ def _irq(event, data):
         _conn = conn_handle
         _state["connected"] = True
         _state["advertising"] = False
+        _state["conn_seq"] += 1
         print("cynthia: BLE MIDI connected")
     elif event == _IRQ_CENTRAL_DISCONNECT:
         _conn = None
@@ -247,6 +261,16 @@ def _inject_incoming(data):
             got = 1   # running status: keep the status byte
 
 
+def forward(msg):
+    """Forward an already-injected message to the host.
+
+    Used for events the C input task injected directly (`cynthia_midi_tap`):
+    those never pass through cynthia.midi.inject(), so the forwarder list never
+    sees them. No echo risk here — the source is a physical control.
+    """
+    _notify(msg)
+
+
 # --- internal MIDI -> host -------------------------------------------------
 
 def _on_internal_midi(msg):
@@ -255,6 +279,10 @@ def _on_internal_midi(msg):
         # This message originated from the host itself; sending it back would
         # double every note (and, with a fast host, loop).
         return
+    _notify(msg)
+
+
+def _notify(msg):
     if not _state["connected"] or _ble is None or _conn is None or _handle is None:
         return
     n = len(msg)

@@ -80,7 +80,16 @@ static const key_pin_t btn_pins[4] = {
     {MCP_ADDR_0, 6}  // Patch Next (PA6, BTN3)
 };
 
-#define POT_EMA_ALPHA 0.3f
+// Per-sample EMA weight. At ~20Hz per pot a 0.3 weight settles in ~3 samples
+// (~150ms), which still feels connected; it was tuned against the old ~9Hz
+// sweep where the same weight meant ~330ms.
+#define POT_EMA_ALPHA 0.35f
+// Pots scanned per input-task iteration. One per iteration meant 16 pots x
+// (2ms ADS conversion + 5ms loop delay) = a 112ms sweep, i.e. **9Hz per pot** —
+// the "knobs are sluggish" complaint. Two per iteration with a 1ms delay gives
+// a ~46ms sweep (~21Hz per pot) while still servicing the key scan every ~6ms,
+// so button latency does not regress.
+#define POTS_PER_ITER 2
 #define JOY_EMA_ALPHA 0.8f
 #define DEBOUNCE_MS 20
 #define LONG_PRESS_MS 800
@@ -109,7 +118,9 @@ static uint32_t s_btn_press_time[5] = {0};
 static bool s_btn_long_fired[5] = {false};
 
 // Button event ring buffer
-#define BTN_EVT_QUEUE_SIZE 16
+// 32 deep: a burst of presses (or a slow VM poll) must not silently drop
+// events, which is indistinguishable from a dead button.
+#define BTN_EVT_QUEUE_SIZE 32
 typedef struct {
     uint8_t btn;
     uint8_t kind; // 0 = short, 1 = long
@@ -121,6 +132,54 @@ static btn_event_t s_evt_queue[BTN_EVT_QUEUE_SIZE];
 // cross-core access, so a consumer could spin on a stale value.
 static volatile uint8_t s_evt_head = 0;
 static volatile uint8_t s_evt_tail = 0;
+
+// MIDI tap ring, drained by the Python UI poll and forwarded to BLE-MIDI.
+//
+// The 28 keys are scanned and injected HERE, in C, so Python's
+// cynthia.midi.inject() never sees a note-on: BLE-MIDI transmitted joystick
+// and pot traffic but never a single note. This buffer is the bridge. It is a
+// ring rather than a callback because the scan runs on the input task (core 0)
+// while the consumer is the MicroPython VM (core 1); pushing 3 bytes is safe
+// cross-core, calling into Python from here is not.
+//
+// Depth 64 is well over what a 30Hz consumer needs to absorb a burst of
+// chords; if it ever fills, the oldest events are simply dropped (a stuck
+// pointer would be far worse).
+#define MIDI_TAP_SIZE 64
+static uint8_t s_midi_tap[MIDI_TAP_SIZE][3];
+static uint8_t s_midi_tap_len[MIDI_TAP_SIZE];
+static volatile uint8_t s_midi_tap_head = 0;
+static volatile uint8_t s_midi_tap_tail = 0;
+static volatile uint32_t s_midi_tap_dropped = 0;
+
+static void midi_tap_push(const uint8_t *msg, uint8_t len) {
+    if (len == 0 || len > 3) return;
+    uint8_t next = (uint8_t)((s_midi_tap_head + 1) % MIDI_TAP_SIZE);
+    if (next == s_midi_tap_tail) {
+        s_midi_tap_dropped++;
+        return;
+    }
+    s_midi_tap[s_midi_tap_head][0] = msg[0];
+    s_midi_tap[s_midi_tap_head][1] = (len > 1) ? msg[1] : 0;
+    s_midi_tap[s_midi_tap_head][2] = (len > 2) ? msg[2] : 0;
+    s_midi_tap_len[s_midi_tap_head] = len;
+    s_midi_tap_head = next;
+}
+
+// Pop one tap event into `out`; returns its length or 0 when empty.
+uint8_t cynthia_midi_tap_pop(uint8_t *out) {
+    if (out == 0 || s_midi_tap_tail == s_midi_tap_head) return 0;
+    uint8_t len = s_midi_tap_len[s_midi_tap_tail];
+    out[0] = s_midi_tap[s_midi_tap_tail][0];
+    out[1] = s_midi_tap[s_midi_tap_tail][1];
+    out[2] = s_midi_tap[s_midi_tap_tail][2];
+    s_midi_tap_tail = (uint8_t)((s_midi_tap_tail + 1) % MIDI_TAP_SIZE);
+    return len;
+}
+
+uint32_t cynthia_midi_tap_dropped(void) {
+    return s_midi_tap_dropped;
+}
 
 static bool s_mcp0_present = false;
 static bool s_mcp1_present = false;
@@ -327,6 +386,7 @@ static void scan_keys_and_buttons(uint32_t now_ms) {
                     midi_msg[2] = 0;
                 }
                 midi_local(midi_msg, 3);
+                midi_tap_push(midi_msg, 3);
             }
         }
     }
@@ -482,12 +542,14 @@ void cynthia_input_task(void *pvParameters) {
         //    I2C scan below can't delay the recovery decision.
         cynthia_wdt_check();
 
-        // 1. Fast Key & Button Scan (100Hz)
+        // 1. Fast Key & Button Scan (every iteration, ~6ms)
         scan_keys_and_buttons(now_ms);
 
-        // 2. Interleaved Pot Scan (1 channel per iteration)
-        read_pot_mux(pot_cursor);
-        pot_cursor = (pot_cursor + 1) % CYNTHIA_NUM_POTS;
+        // 2. Interleaved Pot Scan (POTS_PER_ITER channels per iteration)
+        for (uint8_t _p = 0; _p < POTS_PER_ITER; _p++) {
+            read_pot_mux(pot_cursor);
+            pot_cursor = (uint8_t)((pot_cursor + 1) % CYNTHIA_NUM_POTS);
+        }
 
         // 3. Joystick scan at ~30Hz
         if (now_ms - last_joy_poll >= 33) {
@@ -495,7 +557,7 @@ void cynthia_input_task(void *pvParameters) {
             last_joy_poll = now_ms;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
