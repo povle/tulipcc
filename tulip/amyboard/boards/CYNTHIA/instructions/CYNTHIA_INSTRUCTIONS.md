@@ -669,6 +669,47 @@ configures synth 1 itself, and `_auto_generated_knobs` lines are still applied.
 Consequence: the implicit GM drum kit on channel 10 is no longer installed; a
 sketch that wants drums must say so in its knob lines (amyworld sketches do).
 
+### 13.2d Gestures and per-instrument settings
+
+**All hold gestures live in `cynthia/gestures.py`.** A `HoldGesture` is
+"while `detect()` is true, wait N ms, then fire once", with `progress()` for the
+on-screen bar. Single-button holds are *not* gestures — the C input task already
+turns an 800 ms hold into a `long_press` event — so these cover only what an
+event cannot express: chords and analog-axis conditions.
+
+| Gesture | Detection | Hold | Action |
+|---|---|---|---|
+| Calibrate | Octave− + Octave+ | 5 s | `calibrate_ui()` |
+| Local settings | stick held down (`jy < 0.2`) | 1.2 s | `open_local_settings()` |
+
+Adding one is a single entry in `_gestures`; the progress overlay and the
+"suppress inputs while this gesture is held" check (`_gesture_active(name)`) pick
+it up automatically. Gestures have an `enabled` predicate so they cannot fire
+while a menu is open (the local-settings gesture requires an idle PLAY screen).
+
+**Local (per-instrument) settings** — the instrument's own panel, not the global
+one:
+
+| Row | Behaviour |
+|---|---|
+| Patch | current patch name; stick left/right = prev/next |
+| Knobs | opens the knob-assignment editor |
+| Save patch | opens the save menu |
+| Settings | jumps to the global settings app |
+| Back | leaves |
+
+Future instrument-scoped features (a sequencer) belong here rather than in
+global settings.
+
+**Knob assignments** are a physical-pot → engine-parameter-channel map,
+identity by default, persisted per instrument as `knobs` in
+`/user/instruments/<name>/state.json` (so it survives reboot and does not follow
+you to another instrument). The editor is the pots screen in edit mode: up/down
+selects a physical pot, left/right chooses the parameter, and closing saves. The
+read-only pots view and the parameter overlay both name the *mapped* parameter.
+Persistence is defensive: a corrupt or out-of-range map falls back to identity,
+and saving preserves other keys in `state.json`.
+
 ### 13.3 BLE-MIDI (port of the original `InstrumentBLE.cpp`)
 
 `cynthia/ble_midi.py` advertises the standard BLE-MIDI service

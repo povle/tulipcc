@@ -28,7 +28,7 @@ import sys
 import time
 import tulip
 
-from . import surface, midi, display, i18n, ble_midi as _ble_mod
+from . import surface, midi, display, i18n, gestures, ble_midi as _ble_mod
 from .i18n import t
 
 # Button indices within spark_main's control-button events (§10.1).
@@ -496,6 +496,7 @@ def play(name):
         _name_label = name
     _running = True
     _tick = 0
+    _load_knob_map()
     surface.start()
     # AFTER surface.start(): it resets the cached knob array, so arming before
     # this would snapshot zeros as the baseline and every real position would
@@ -566,6 +567,7 @@ def attach_current(name):
         _name_label = None
     _running = True
     _tick = 0
+    _load_knob_map()
     surface.start()
     _arm_pot_pickup()
     _start_poll()
@@ -875,9 +877,13 @@ def _poll_body(tick):
                 if d < PICKUP_EPS:
                     continue
                 _pot_armed[ch] = True
-            _engine.update_pot(ch, v)
-            # Record for the param-name overlay.
-            _last_knob_ch = ch
+            # Physical pot -> engine parameter channel. Identity unless the
+            # player reassigned it in the instrument's local settings.
+            target = _knob_map[ch] if ch < len(_knob_map) else ch
+            _engine.update_pot(target, v)
+            # Record the MAPPED channel so the overlay names the parameter that
+            # actually changed.
+            _last_knob_ch = target
             _last_knob_time = now
             mark_dirty()
 
@@ -913,11 +919,21 @@ def _poll_body(tick):
     elif _settings_active:
         if joy is not None:
             _handle_joystick_settings(jx, jy)
+    elif _local_active:
+        if joy is not None:
+            _handle_joystick_local(jx, jy)
+    elif _pots_active and _pots_edit:
+        if joy is not None:
+            _handle_joystick_pots(jx, jy)
 
-    # Hold Octave- and Octave+ together for 5s to calibrate. Read as a HELD
-    # mask rather than button events: events only report short/long presses,
-    # so a two-button chord has no event of its own.
-    _check_calibration_chord(now)
+    # Hold gestures (chords and axis holds). Single-button holds arrive as
+    # long_press events from the C input task; these cover what an event
+    # cannot express. See cynthia/gestures.py.
+    _gestures.poll(now)
+    # A held gesture draws a progress bar; repaint while one is engaged (the
+    # ordinary redraw-on-change would leave it stale for up to 2s).
+    if _gestures.active() is not None:
+        mark_dirty()
 
     # Route control-button events.
     for ev in surface.events():
@@ -984,6 +1000,10 @@ _JOY_REPEAT_MS = 280    # auto-repeat while held
 
 _joy_dir = [0, 0]       # latched direction per axis (-1, 0, +1)
 _joy_next = [0, 0]      # ticks_ms of the next auto-repeat per axis
+# After a screen change the stick must return near centre once before it can
+# step again. Otherwise opening a screen while the stick is deflected (e.g. the
+# hold-down gesture that opens local settings) immediately scrolls the cursor.
+_joy_armed = [True, True]
 
 
 def _joy_axis(i, v, now, repeat_ms=_JOY_REPEAT_MS):
@@ -992,6 +1012,10 @@ def _joy_axis(i, v, now, repeat_ms=_JOY_REPEAT_MS):
     Returns -1/0/+1; non-zero only on a fresh deflection or an auto-repeat, so
     callers can treat it as "one move".
     """
+    if not _joy_armed[i]:
+        if abs(v - 0.5) <= _JOY_RELEASE:
+            _joy_armed[i] = True
+        return 0
     d = 0
     if v > 0.5 + _JOY_DEAD:
         d = 1
@@ -1012,8 +1036,9 @@ def _joy_axis(i, v, now, repeat_ms=_JOY_REPEAT_MS):
 
 
 def _joy_reset():
-    """Forget latched directions (called when a screen closes)."""
+    """Forget latched directions and require a neutral stick before stepping."""
     _joy_dir[0] = _joy_dir[1] = 0
+    _joy_armed[0] = _joy_armed[1] = False
 
 
 def _handle_joystick_menu(jx, jy):
@@ -1087,30 +1112,6 @@ def _octave_feedback(before, after):
     print("cynthia: octave", after)
 
 
-def _check_calibration_chord(now):
-    """Start calibration when Octave- and Octave+ are held together 5s."""
-    global _chord_start
-    if _STOP_POLL:
-        return
-    try:
-        b = surface.buttons()
-    except Exception:
-        return
-    both = b.get("octave_down") and b.get("octave_up")
-    if not both:
-        if _chord_start is not None:
-            _chord_start = None
-            mark_dirty()
-        return
-    if _chord_start is None:
-        _chord_start = now
-        return
-    held = time.ticks_diff(now, _chord_start)
-    if held >= CALIBRATE_CHORD_MS:
-        _chord_start = None
-        calibrate_ui()
-
-
 def _handle_event(ev):
     global _menu_active, _menu_row, _menu_col, _menu_insts
     global _patch_list_active, _patch_list_cursor
@@ -1121,8 +1122,14 @@ def _handle_event(ev):
     if ev[0] == "button":
         _, idx, kind = ev
         if _pots_active:
-            # Any button leaves the read-only pots screen.
+            # Any button leaves the pots screen (edit mode saves first).
             close_pots()
+            return
+        if _local_active:
+            if kind == "short_press" and idx == 4:
+                _local_activate()
+            elif kind == "short_press" and idx == BTN_PATCH_PREV:
+                close_local_settings()
             return
         # Octave buttons have no long-press function (the slot is reserved and
         # unused), so a hold was silently doing NOTHING — which reads as "the
@@ -1131,7 +1138,7 @@ def _handle_event(ev):
         if kind == "long_press" and idx in (BTN_OCTAVE_DOWN, BTN_OCTAVE_UP):
             # ...unless the 5s calibration chord is in progress, in which case
             # both octave buttons are held on purpose and must not shift octaves.
-            if _chord_start is not None:
+            if _gesture_active("calibrate"):
                 return
             kind = "short_press"
         # Long-press on joystick button (idx 4) opens menu (C++ System.cpp)
@@ -1149,7 +1156,9 @@ def _handle_event(ev):
                                        or _save_menu_active or _patch_list_active):
                     open_pots()
                     return
-            if _pots_active:
+            if _local_active:
+                close_local_settings()
+            elif _pots_active:
                 close_pots()
             elif _save_menu_active:
                 _close_save_menu()
@@ -1568,19 +1577,107 @@ def _handle_joystick_settings(jx, jy):
 # "Custom 3" was to turn each one. This lists them with live bars, and shows
 # which pots are still waiting for pickup (so a patch's parameters are safe).
 _pots_active = False
+_pots_edit = False       # opened from local settings: assignments are editable
+_pots_sel = 0            # physical pot under the cursor while editing
 
 
-def open_pots():
-    global _pots_active
+def open_pots(edit=False):
+    global _pots_active, _pots_edit, _pots_sel
     _pots_active = True
+    _pots_edit = edit
+    _pots_sel = 0
     _joy_reset()
     _draw_ui(force=True)
 
 
 def close_pots():
-    global _pots_active
+    global _pots_active, _pots_edit
+    if _pots_edit:
+        _save_knob_map()
     _pots_active = False
+    _pots_edit = False
+    _joy_reset()
     _draw_ui(force=True)
+
+
+def _param_name(ch):
+    """Display name of engine parameter channel `ch`."""
+    if _engine is not None and hasattr(_engine, "pot_name"):
+        try:
+            n = _engine.pot_name(ch)
+            if n:
+                return n
+        except Exception:
+            pass
+    k = _POT_NAME_KEYS[ch] if ch < len(_POT_NAME_KEYS) else None
+    return t(k) if k else "Ch%d" % (ch + 1)
+
+
+def _draw_pots_edit(disp):
+    """Assignment editor: physical pot -> engine parameter channel."""
+    title = t("knob_map")
+    tw = disp.str_width(display.FONT_5X7, title)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 9, title, 1)
+    disp.hline(0, 11, 128, 1)
+
+    line_h = 10
+    visible = 5
+    total = 16
+    top = _pots_sel - visible + 1
+    if top < 0:
+        top = 0
+    if top > total - visible:
+        top = total - visible
+
+    for i in range(visible):
+        idx = top + i
+        if idx >= total:
+            break
+        row_y = 12 + i * line_h
+        target = _knob_map[idx] if idx < len(_knob_map) else idx
+        text = "P%02d %s" % (idx + 1, _param_name(target))
+        text = disp.fit_text(display.FONT_5X7, text, 120)
+        if idx == _pots_sel:
+            disp.fill_rect(0, row_y, 128, line_h, 1)
+            disp.draw_str(display.FONT_5X7, 2, row_y + 8, text, 0)
+        else:
+            disp.draw_str(display.FONT_5X7, 2, row_y + 8, text, 1)
+
+    if total > visible:
+        track_y, track_h = 12, 50
+        disp.rect(126, track_y, 2, track_h, 1)
+        thumb_h = max(4, (visible * track_h) // total)
+        denom = total - visible
+        off = 0 if denom <= 0 else (top * (track_h - thumb_h)) // denom
+        disp.fill_rect(126, track_y + off, 2, thumb_h, 1)
+
+
+def _handle_joystick_pots(jx, jy):
+    """Edit mode: up/down select a pot, left/right change its target."""
+    global _pots_sel
+    now = time.ticks_ms()
+    changed = False
+
+    dy = _joy_axis(1, jy, now)
+    if dy:
+        new_sel = _pots_sel - dy
+        if new_sel < 0:
+            new_sel = 0
+        elif new_sel > 15:
+            new_sel = 15
+        if new_sel != _pots_sel:
+            _pots_sel = new_sel
+            changed = True
+
+    dx = _joy_axis(0, jx, now)
+    if dx:
+        tgt = (_knob_map[_pots_sel] + dx) % 16
+        _knob_map[_pots_sel] = tgt
+        changed = True
+
+    if changed:
+        mark_dirty()
+        _draw_ui(force=True)
 
 
 def is_pots_active():
@@ -1608,18 +1705,9 @@ def _draw_pots_ui(disp):
         row = i % 8
         x = col * 64
         y = 14 + row * 6
-        # Param name: the engine's own label when it has one, else the
-        # universal standard-pot name.
-        if _engine is not None and hasattr(_engine, "pot_name"):
-            try:
-                name = _engine.pot_name(i)
-            except Exception:
-                name = None
-        else:
-            name = None
-        if not name:
-            k = _POT_NAME_KEYS[i] if i < len(_POT_NAME_KEYS) else None
-            name = t(k) if k else "Ch%d" % (i + 1)
+        # Name the MAPPED parameter: if pot 3 was reassigned to cutoff, this
+        # row must say cutoff, not whatever pot 3 used to do.
+        name = _param_name(_knob_map[i] if i < len(_knob_map) else i)
         armed = i < len(_pot_armed) and _pot_armed[i]
         # Unarmed pots are waiting for pickup: mark them so the user knows why
         # turning this pot has not changed the sound yet.
@@ -1842,10 +1930,17 @@ def _draw_ui(force=False):
         return
     disp.fill(0)
 
-    # The pots screen is a full-panel view (it draws its own title), so it must
-    # not sit under the normal header.
+    # The pots and local-settings screens are full-panel views (they draw their
+    # own titles), so they must not sit under the normal header.
+    if _local_active:
+        _draw_local_ui(disp)
+        disp.show()
+        return
     if _pots_active:
-        _draw_pots_ui(disp)
+        if _pots_edit:
+            _draw_pots_edit(disp)
+        else:
+            _draw_pots_ui(disp)
         disp.show()
         return
 
@@ -1927,17 +2022,16 @@ def _draw_ui(force=False):
         _draw_settings_ui(disp)
         disp.show()
         return
-    if _chord_start is not None:
-        # Chord progress: show how much longer to hold, so the 5s gesture is
-        # discoverable rather than feeling like nothing happened.
-        held = time.ticks_diff(time.ticks_ms(), _chord_start)
-        frac = min(1.0, held / float(CALIBRATE_CHORD_MS))
+    _g = _gestures.active()
+    if _g is not None:
+        # Any hold gesture shows its own label and progress, so adding a
+        # gesture never needs another branch here.
+        _label = _g.label() if callable(_g.label) else (_g.label or _g.name)
         disp.fill(0)
-        tw = disp.str_width(display.FONT_5X7, t("calibrate"))
-        disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 24,
-                      t("calibrate"), 1)
+        tw = disp.str_width(display.FONT_5X7, _label)
+        disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 24, _label, 1)
         disp.rect(14, 34, 100, 10, 1)
-        w = int(96 * frac)
+        w = int(96 * _g.progress())
         if w > 0:
             disp.fill_rect(16, 36, w, 6, 1)
         disp.show()
@@ -1969,7 +2063,6 @@ _STOP_POLL = False  # Prevent _poll from running during calibration
 # Hold-to-calibrate chord: Octave- + Octave+ together for this long. Stored as
 # the ticks_ms() when the chord was first seen, or None when not held.
 CALIBRATE_CHORD_MS = 5000
-_chord_start = None
 
 # Polls a boot must survive before it counts as stable (see _poll). At ~30Hz that
 # is roughly 5 seconds — the same order as the 5s task watchdog timeout, so a
@@ -2064,12 +2157,11 @@ def calibrate_ui():
     Every exit path re-arms the watchdog and repaints, because a calibration
     that dies half way must not leave the board without a liveness signal.
     """
-    global _STOP_POLL, _chord_start
+    global _STOP_POLL
     if _STOP_POLL:
         # Already calibrating (e.g. the chord fired twice); do not nest.
         return
     _STOP_POLL = True
-    _chord_start = None
     _disarm_watchdog()
     disp = surface.display()
     try:
@@ -2127,3 +2219,247 @@ def calibrate_ui():
         _arm_watchdog()
         mark_dirty()
         _draw_ui(force=True)
+
+
+# --- Per-instrument (local) settings ---------------------------------------
+# Reached by holding the stick down (~1.2s), or by long-pressing the joystick
+# button while the stick is down. This is the instrument's own panel: its
+# patches, its knob assignments, and a door to the global settings. Future
+# instrument-scoped features (sequencer) belong here rather than in the global
+# settings app.
+_local_active = False
+_local_row = 0
+_local_scroll = 0
+
+# Physical pot -> engine parameter channel. Identity by default; persisted per
+# instrument in state.json so an assignment survives a reboot and does not
+# follow you to another instrument.
+_knob_map = list(range(16))
+
+
+def _local_rows():
+    return [
+        ("patch", "patch", "patch"),
+        ("knobs", "action", "knob_map"),
+        ("save", "action", "save_patch"),
+        ("global", "action", "settings"),
+        ("back", "action", "back"),
+    ]
+
+
+def _inst_state_path():
+    return "/user/instruments/%s/state.json" % _name if _name else None
+
+
+def _load_knob_map():
+    """Load this instrument's pot routing, defaulting to identity."""
+    global _knob_map
+    _knob_map = list(range(16))
+    path = _inst_state_path()
+    if not path:
+        return
+    try:
+        import json
+        with open(path) as f:
+            data = json.load(f)
+        m = data.get("knobs") if isinstance(data, dict) else None
+        if isinstance(m, list) and len(m) == 16:
+            ok = True
+            for v in m:
+                if not isinstance(v, int) or v < 0 or v > 15:
+                    ok = False
+                    break
+            if ok:
+                _knob_map = m
+    except (OSError, ValueError):
+        pass
+
+
+def _save_knob_map():
+    """Persist the pot routing, preserving any other per-instrument state."""
+    path = _inst_state_path()
+    if not path:
+        return False
+    import json
+    data = {}
+    try:
+        with open(path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        pass
+    data["knobs"] = _knob_map
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return True
+    except OSError:
+        return False
+
+
+def open_local_settings():
+    global _local_active, _local_row, _local_scroll
+    _local_active = True
+    _local_row = 0
+    _local_scroll = 0
+    _joy_reset()
+    _draw_ui(force=True)
+
+
+def close_local_settings():
+    global _local_active
+    _local_active = False
+    _joy_reset()
+    _draw_ui(force=True)
+
+
+def is_local_settings_active():
+    return _local_active
+
+
+def _draw_local_ui(disp):
+    title = (_name_label or _name or "CYNTHIA").upper()
+    title = disp.fit_text(display.FONT_5X7, title, 120)
+    tw = disp.str_width(display.FONT_5X7, title)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 16, title, 1)
+    disp.hline(0, 19, 128, 1)
+
+    rows = _local_rows()
+    line_h = 8
+    visible = 5
+    start_y = 28
+    global _local_scroll
+    if _local_row < _local_scroll:
+        _local_scroll = _local_row
+    elif _local_row >= _local_scroll + visible:
+        _local_scroll = _local_row - visible + 1
+
+    for i in range(visible):
+        ri = _local_scroll + i
+        if ri >= len(rows):
+            break
+        key, kind, label_key = rows[ri]
+        y = start_y + i * line_h
+        sel = (ri == _local_row)
+        label = disp.fit_text(display.FONT_5X7, t(label_key), 62)
+        if key == "patch":
+            val = current_patch_name() or "---"
+            val = disp.fit_text(display.FONT_5X7, str(val), 58)
+        else:
+            val = ""
+        if sel:
+            disp.fill_rect(0, y - 6, 126, line_h, 1)
+            disp.draw_str(display.FONT_5X7, 2, y, label, 0)
+            if val:
+                vx = 122 - disp.str_width(display.FONT_5X7, val)
+                disp.draw_str(display.FONT_5X7, max(62, vx), y, val, 0)
+        else:
+            disp.draw_str(display.FONT_5X7, 2, y, label, 1)
+            if val:
+                vx = 122 - disp.str_width(display.FONT_5X7, val)
+                disp.draw_str(display.FONT_5X7, max(62, vx), y, val, 1)
+
+    if len(rows) > visible:
+        track_y, track_h = 22, 40
+        disp.rect(126, track_y, 2, track_h, 1)
+        thumb_h = max(4, (visible * track_h) // len(rows))
+        denom = len(rows) - visible
+        off = 0 if denom <= 0 else (_local_scroll * (track_h - thumb_h)) // denom
+        disp.fill_rect(126, track_y + off, 2, thumb_h, 1)
+
+
+def _local_activate():
+    """Enter/execute the selected local-settings row."""
+    rows = _local_rows()
+    if not (0 <= _local_row < len(rows)):
+        return
+    key = rows[_local_row][0]
+    if key == "back":
+        close_local_settings()
+    elif key == "knobs":
+        close_local_settings()
+        open_pots(edit=True)
+    elif key == "save":
+        if _engine is not None and hasattr(_engine, "save_patch_state"):
+            close_local_settings()
+            _open_save_menu()
+        else:
+            toast(t("cannot_save"), 1200)
+    elif key == "global":
+        close_local_settings()
+        open_settings()
+
+
+def _handle_joystick_local(jx, jy):
+    global _local_row
+    now = time.ticks_ms()
+    rows = _local_rows()
+    changed = False
+
+    dy = _joy_axis(1, jy, now)
+    if dy:
+        new_row = _local_row - dy
+        if new_row < 0:
+            new_row = 0
+        elif new_row > len(rows) - 1:
+            new_row = len(rows) - 1
+        if new_row != _local_row:
+            _local_row = new_row
+            changed = True
+
+    if rows[_local_row][0] == "patch":
+        dx = _joy_axis(0, jx, now)
+        if dx > 0:
+            next_patch()
+            changed = True
+        elif dx < 0:
+            prev_patch()
+            changed = True
+
+    if changed:
+        _draw_ui(force=True)
+
+
+# --- Gestures --------------------------------------------------------------
+# Everything that is "hold X for a while": chords and axis conditions. Single
+# button holds are already turned into long_press events by the C input task
+# and handled in _handle_event; these cover what an event cannot express.
+
+def _ui_free():
+    return not (_menu_active or _settings_active or _save_menu_active
+                or _patch_list_active or _pots_active or _local_active
+                or _STOP_POLL or not _running)
+
+
+def _both_octave_held():
+    b = surface.buttons()
+    return bool(b.get("octave_down") and b.get("octave_up"))
+
+
+def _stick_down():
+    joy = surface.joystick()
+    return joy is not None and joy[1] < 0.2
+
+
+_gestures = gestures.GestureSet([
+    # Hold Octave- and Octave+ together to calibrate.
+    gestures.HoldGesture(
+        "calibrate", _both_octave_held, CALIBRATE_CHORD_MS, calibrate_ui,
+        label=lambda: t("calibrate"),
+        enabled=lambda: not _STOP_POLL),
+    # Hold the stick down for the instrument's own settings. Requires the UI to
+    # be idle so it cannot fire while navigating a menu.
+    gestures.HoldGesture(
+        "local", _stick_down, 1200, open_local_settings,
+        label=lambda: t("instrument_settings"),
+        enabled=_ui_free),
+])
+
+
+def _gesture_active(name):
+    """True while gesture `name` is being held (used to suppress its inputs)."""
+    for g in _gestures.gestures:
+        if g.name == name:
+            return g.active()
+    return False
