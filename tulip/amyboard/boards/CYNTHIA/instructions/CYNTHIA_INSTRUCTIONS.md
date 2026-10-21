@@ -650,7 +650,15 @@ shows `n/pages`.
 
 ### 13.2c Instruments own the synth — no AMYboard boot defaults
 
-`amyboard.start_amy()` and `_apply_knobs_text()` install AMYboard's boot state
+**The actual cause** was `_boot.py`: `midi.setup()` ran for every board except
+AMYBOARD/AMYBOARD_WEB/AMYBOARD_VCV, and CYNTHIA was not excluded. That calls
+`add_default_synths()`, which installs `PatchSynth(patch=0, num_voices=6)` on
+channel 1 — the first Juno patch — *after* `start_amy()` had already run the
+sketch. CYNTHIA is now excluded (it is an AMYboard-class board, not Tulip-REPL;
+`midi.config` stays None, and the `c_fired_midi_event` callback CYNTHIA installs
+does not use it). This also stops the boot bleep.
+
+A second, smaller contributor: `amyboard.start_amy()` and `_apply_knobs_text()` install AMYboard's boot state
 with **queued raw wire messages**: `S<RESET_SYNTHS>`, `i1K257iv6` (the default
 Juno patch) and `i10K384iv1` (GM drums). Those are drained by AMY *later* than a
 sketch's `amy.send()`, so on CYNTHIA they arrived after the DX7 sketch had set its

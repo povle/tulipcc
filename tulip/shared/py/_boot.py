@@ -385,6 +385,13 @@ if board() == "CYNTHIA":
 if board() == "AMYBOARD" or board() == "AMYBOARD_WEB" or board() == "AMYBOARD_VCV" or board() == "CYNTHIA":
     tulip.midi_callback(midi.c_fired_midi_event)
 
-if board() != "AMYBOARD" and board() != "AMYBOARD_WEB" and board() != "AMYBOARD_VCV":
+# CYNTHIA is an AMYboard-class board, not a Tulip-REPL one: it restores an
+# instrument and that instrument's engine owns synth 1. Calling midi.setup()
+# here installs the Tulip default synths — PatchSynth(patch=0) on channel 1,
+# i.e. the first Juno patch — AFTER start_amy() has already run the sketch, so
+# booting into DX7 sounded correct for about a second and was then silently
+# replaced. (It also fires startup_bleep().) Exclude it like the other
+# AMYboard-family boards.
+if board() not in ("AMYBOARD", "AMYBOARD_WEB", "AMYBOARD_VCV", "CYNTHIA"):
     midi.setup() # Just mirrors the setup mostly managed by AMY for Tulip-REPL systems.
 
