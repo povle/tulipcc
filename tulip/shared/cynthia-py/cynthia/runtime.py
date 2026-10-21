@@ -2300,6 +2300,7 @@ def _save_knob_map():
 
 def open_local_settings():
     global _local_active, _local_row, _local_scroll
+    _stick_armed[0] = False     # must release the stick before it fires again
     _local_active = True
     _local_row = 0
     _local_scroll = 0
@@ -2437,9 +2438,20 @@ def _both_octave_held():
     return bool(b.get("octave_down") and b.get("octave_up"))
 
 
+# The stick must return to centre once between uses of the hold-down gesture.
+# Without this, leaving local settings while still holding the stick down
+# re-opens it 1.2s later, forever.
+_stick_armed = [True]
+
+
 def _stick_down():
     joy = surface.joystick()
-    return joy is not None and joy[1] < 0.2
+    if joy is None:
+        return False
+    if joy[1] > 0.4:
+        _stick_armed[0] = True
+        return False
+    return _stick_armed[0] and joy[1] < 0.2
 
 
 _gestures = gestures.GestureSet([
