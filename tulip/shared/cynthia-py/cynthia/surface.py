@@ -99,6 +99,19 @@ def knobs():
     return _values
 
 
+def has_relative_knobs():
+    """True when the pot board reports rotation deltas instead of absolute
+    positions (the new endless-pot board)."""
+    return _pot is not None and hasattr(_pot, "knob_deltas")
+
+
+def knob_deltas():
+    """[(pot_index, turns)] since the last call, or () when unsupported."""
+    if _pot is not None and hasattr(_pot, "knob_deltas"):
+        return _pot.knob_deltas()
+    return ()
+
+
 def knob_changes(epsilon=KNOB_EPSILON):
     """[(index, value)] for pots that moved more than epsilon since the last
     call. Used by the runtime to route only real movements to the sketch.

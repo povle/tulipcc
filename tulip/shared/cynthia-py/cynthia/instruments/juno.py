@@ -217,6 +217,34 @@ class JunoInstrument:
             return POT_NAMES[channel]
         return "Pot %d" % channel
 
+    def get_pot(self, channel):
+        """Current 0..1 value of the parameter `channel` drives, or None.
+
+        Lets the runtime seed relative (endless) knob positions from the loaded
+        patch, so turning a knob never snaps the parameter to the knob's
+        physical angle. Channels whose value is not a patch field (LFO target,
+        delay level/time) return None; the runtime then falls back to the
+        absolute position for those.
+        """
+        if self.patch is None or channel < 0 or channel >= len(POT_MAP_16):
+            return None
+        param = POT_MAP_16[channel]
+        if param is None:
+            if channel == 1:
+                return 1.0 if self.patch.saw else 0.0
+            if channel == 3:
+                return self.patch.hpf / 3.0
+            if channel == 15:
+                return self.patch.dco_noise
+            return None
+        v = getattr(self.patch, param, None)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
     def update_pot(self, channel, value):
         """Update a pot by channel (0-15). Handles Juno-specific mapping
         matching InstrumentJuno.cpp updatePot()."""

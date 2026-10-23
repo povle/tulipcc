@@ -428,6 +428,16 @@ Driver notes worth keeping:
   50 Hz scan rate burned ~2.5% of the frame.
 - `stop()` deinits the SPI host: `machine.SPI(id)` cannot be created twice, so
   a driver reload otherwise fails with "SPI host already in use".
+- **Relative (endless) knobs.** `knob_deltas()` reports rotation, not position.
+  The runtime seeds a virtual position per pot from the engine's own value
+  (`JunoInstrument.get_pot()`) at every instrument/patch change, then applies
+  deltas to it. That is what removes the snap: loading a patch leaves the
+  parameters alone, touching a knob moves the parameter by the angle turned, and
+  hitting 0 or 1 simply pins it there (reversing responds immediately). Deltas
+  are emitted in 2-degree steps (`DELTA_DEADBAND_DEG`), which is the hysteresis
+  that stops wiper noise from integrating into a slow drift — measured: 100
+  scans of ±1-degree jitter emit nothing. Wrap is handled, so 355°→5° is +10°,
+  not -350°. Engines without `get_pot` fall back to absolute+pickup.
 - The LED strip is optional and best-effort: a missing `neopixel` module or an
   unpopulated strip logs a warning and leaves the pots working. `neopixel` is
   frozen in `boards/manifest.py` so it is available offline.

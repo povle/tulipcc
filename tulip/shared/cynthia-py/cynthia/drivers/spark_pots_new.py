@@ -51,6 +51,20 @@ SCAN_PERIOD_MS = 20
 # Pot movement that justifies rewriting the LED strip (see _update_leds_auto).
 LED_EPSILON = 0.004
 
+# Endless knobs: rotation is reported as DELTAS, not an absolute position.
+#
+# Absolute mapping is wrong for a 360-degree pot on an absolute parameter: the
+# knob's physical angle has nothing to do with the patch's value, so touching it
+# snapped the parameter to the knob, and turning past the wrap point slammed it
+# from max to min. Deltas fix both: the value only moves by the amount the knob
+# turns.
+#
+# Emitted in 2-degree steps. That is the hysteresis that keeps ADC/wiper noise
+# from accumulating into a slow drift while the knob sits still: the anchor only
+# advances when a step is emitted, so noise below the threshold is discarded
+# rather than integrated.
+DELTA_DEADBAND_DEG = 2.0
+
 
 def _ticks_diff(a, b):
     """Wrap-safe tick difference."""
@@ -81,6 +95,10 @@ class Driver:
         self._rx = bytearray(2)
         # Knob values 0..1 (angle / 360), exposed via knobs().
         self.values = [0.0] * NUM_POTS
+        # Rotation accumulation for relative mode (see DELTA_DEADBAND_DEG).
+        self._anchor = [None] * NUM_POTS   # last angle a delta was emitted at
+        self._delta = [0.0] * NUM_POTS     # pending turns since last read
+        self._has_delta = False
         # Last values the LED strip was told about. A 16-LED WS2812 write is
         # ~0.5ms of blocking, so pushing every scan (50Hz) wasted 2.5% of the
         # frame to redraw colours that had not changed.
@@ -126,6 +144,10 @@ class Driver:
             except Exception:
                 pass
             self._spi = None
+        for i in range(NUM_POTS):
+            self._anchor[i] = None
+            self._delta[i] = 0.0
+        self._has_delta = False
         self.slot.release()
 
     # --- MCP3002 ---
@@ -226,6 +248,22 @@ class Driver:
         for i in range(NUM_POTS):
             ang = self._compute_angle(self._phase0[i], self._phase1[i])
             self.values[i] = ang / 360.0
+            # Relative mode: accumulate wrap-aware rotation in degrees, emitted
+            # in DELTA_DEADBAND_DEG steps from an anchor that only moves when a
+            # step is emitted.
+            anchor = self._anchor[i]
+            if anchor is None:
+                self._anchor[i] = ang
+            else:
+                d = ang - anchor
+                if d > 180.0:
+                    d -= 360.0
+                elif d < -180.0:
+                    d += 360.0
+                if d >= DELTA_DEADBAND_DEG or d <= -DELTA_DEADBAND_DEG:
+                    self._delta[i] += d / 360.0
+                    self._has_delta = True
+                    self._anchor[i] = ang
         if self._leds and self._led_mode == "auto":
             self._update_leds_auto()
 
@@ -249,9 +287,22 @@ class Driver:
         self.scan()
 
     def knobs(self):
-        """16 knob positions 0..1 (absolute angle / 360). Endless knobs —
-        surface.sync_knobs() handles takeover (§9.1)."""
+        """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
         return self.values
+
+    def knob_deltas(self):
+        """Rotation since the last call: [(pot_index, turns)]. Deltas are
+        consumed. Returns () (no allocation) when nothing turned."""
+        if not self._has_delta:
+            return ()
+        out = []
+        for i in range(NUM_POTS):
+            d = self._delta[i]
+            if d:
+                out.append((i, d))
+                self._delta[i] = 0.0
+        self._has_delta = False
+        return out
 
     # --- NeoPixels (§10.2) ---
 

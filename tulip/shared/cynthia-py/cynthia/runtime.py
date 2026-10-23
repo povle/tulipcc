@@ -75,10 +75,93 @@ _POT_NAME_KEYS = [
 #
 # This is the standard synth answer: ignore absolute positions until the player
 # turns the control, then let it take over.
+# Relative ("endless") pots: the new board reports rotation, so a parameter
+# only moves by the amount the knob turns and never snaps to the knob's
+# physical angle when a patch loads. Positions are seeded from the engine's own
+# value for that parameter at every patch/instrument change.
+_rel_pots = False
+_pot_pos = [0.5] * 16
+
 PICKUP_EPS = 0.03
 _pot_armed = [True] * 16
 _pot_base = [0.0] * 16
 _pot_count = 16
+
+
+def _clamp01(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.5
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _seed_pot_positions():
+    """Seed the virtual knob positions from the loaded patch.
+
+    Called wherever the engine's parameters change underneath us (instrument
+    load, patch select). This is what removes the snap: the next turn starts
+    from the patch's value, not from the knob's physical angle. Parameters the
+    engine cannot report fall back to the knob's absolute position (the old
+    behaviour) so a driver without a getter still works.
+    """
+    global _rel_pots, _pot_pos
+    try:
+        _rel_pots = surface.has_relative_knobs()
+    except Exception:
+        _rel_pots = False
+    if not _rel_pots:
+        return
+    # Discard rotation accumulated before this point (e.g. while no instrument
+    # was loaded, so nothing consumed it). Without this the first turn after
+    # loading would apply the whole backlog as one jump.
+    try:
+        surface.knob_deltas()
+    except Exception:
+        pass
+    try:
+        kn = surface.knobs()
+    except Exception:
+        kn = []
+    for ch in range(16):
+        target = _knob_map[ch] if ch < len(_knob_map) else ch
+        v = None
+        if _engine is not None and hasattr(_engine, "get_pot"):
+            try:
+                v = _engine.get_pot(target)
+            except Exception:
+                v = None
+        if v is None:
+            v = kn[ch] if ch < len(kn) else 0.5
+        _pot_pos[ch] = _clamp01(v)
+
+
+def _apply_knob_deltas(now):
+    """Relative mode: move each parameter by the rotation just reported."""
+    global _last_knob_ch, _last_knob_time
+    for ch, d in surface.knob_deltas():
+        if ch < 0 or ch >= 16:
+            continue
+        target = _knob_map[ch] if ch < len(_knob_map) else ch
+        p = _pot_pos[ch] + d
+        if p < 0.0:
+            p = 0.0
+        elif p > 1.0:
+            p = 1.0
+        if p == _pot_pos[ch]:
+            # At an end stop: rotation into it is swallowed, and reversing
+            # responds immediately because the position tracks the end value
+            # rather than the knob's physical angle.
+            continue
+        _pot_pos[ch] = p
+        _engine.update_pot(target, p)
+        _last_knob_ch = target
+        _last_knob_time = now
+        mark_dirty()
 
 
 def _arm_pot_pickup():
@@ -93,6 +176,7 @@ def _arm_pot_pickup():
         _pot_count = 0
         _pot_base = []
         _pot_armed = []
+    _seed_pot_positions()
 
 
 def pot_pickup_state():
@@ -865,32 +949,36 @@ def _poll_body(tick):
     now = time.ticks_ms()
     surface.poll(now)
 
-    # Route pot movements to the engine (§9.2 -> instrument params).
+    # Route pot movement to the engine (§9.2 -> instrument params).
     if _engine is not None and hasattr(_engine, "update_pot"):
-        for ch, v in surface.knob_changes():
-            # Pickup: a freshly loaded patch owns its parameters until the
-            # player actually moves this control.
-            if ch < len(_pot_armed) and not _pot_armed[ch]:
-                d = v - _pot_base[ch]
-                if d < 0:
-                    d = -d
-                if d < PICKUP_EPS:
-                    continue
-                _pot_armed[ch] = True
-            # Physical pot -> engine parameter channel. Identity unless the
-            # player reassigned it in the instrument's local settings.
-            target = _knob_map[ch] if ch < len(_knob_map) else ch
-            _engine.update_pot(target, v)
-            # Record the MAPPED channel so the overlay names the parameter that
-            # actually changed.
-            _last_knob_ch = target
-            _last_knob_time = now
-            mark_dirty()
+        if _rel_pots:
+            _apply_knob_deltas(now)
+        else:
+            for ch, v in surface.knob_changes():
+                # Pickup: a freshly loaded patch owns its parameters until the
+                # player actually moves this control.
+                if ch < len(_pot_armed) and not _pot_armed[ch]:
+                    d = v - _pot_base[ch]
+                    if d < 0:
+                        d = -d
+                    if d < PICKUP_EPS:
+                        continue
+                    _pot_armed[ch] = True
+                # Physical pot -> engine parameter channel. Identity unless the
+                # player reassigned it in the instrument's local settings.
+                target = _knob_map[ch] if ch < len(_knob_map) else ch
+                _engine.update_pot(target, v)
+                # Record the MAPPED channel so the overlay names the parameter
+                # that actually changed.
+                _last_knob_ch = target
+                _last_knob_time = now
+                mark_dirty()
 
     # Forward MIDI that the C input task injected directly (the 28 keys).
     # Those bypass cynthia.midi.inject(), so the BLE forwarder never sees them
     # and the host received joystick/pot traffic but no notes at all.
     _drain_midi_tap()
+
 
     # Joystick → MIDI pitch bend (X axis) + modulation (Y axis), C++ style.
     #
@@ -1594,6 +1682,9 @@ def close_pots():
     global _pots_active, _pots_edit
     if _pots_edit:
         _save_knob_map()
+        # Reassigning pots changes which parameter each virtual position points
+        # at, so re-seed from the new targets (no snap on the next turn).
+        _seed_pot_positions()
     _pots_active = False
     _pots_edit = False
     _joy_reset()
@@ -1708,7 +1799,11 @@ def _draw_pots_ui(disp):
         # Name the MAPPED parameter: if pot 3 was reassigned to cutoff, this
         # row must say cutoff, not whatever pot 3 used to do.
         name = _param_name(_knob_map[i] if i < len(_knob_map) else i)
-        armed = i < len(_pot_armed) and _pot_armed[i]
+        # In relative mode the bar shows the parameter's virtual position, which
+        # is what the knob is actually controlling; the absolute angle would be
+        # misleading. "Not captured" only exists in absolute/pickup mode.
+        armed = (i < len(_pot_armed) and _pot_armed[i]) or _rel_pots
+        shown = _pot_pos[i] if _rel_pots and i < len(_pot_pos) else kn[i]
         # Unarmed pots are waiting for pickup: mark them so the user knows why
         # turning this pot has not changed the sound yet.
         label = disp.fit_text(display.FONT_4X6, name, 34)
@@ -1716,7 +1811,7 @@ def _draw_pots_ui(disp):
         # Bar
         bx, bw = x + 38, 24
         disp.rect(bx, y, bw, 5, 1)
-        w = int((bw - 2) * max(0.0, min(1.0, kn[i])))
+        w = int((bw - 2) * max(0.0, min(1.0, shown)))
         if w > 0:
             disp.fill_rect(bx + 1, y + 1, w, 3, 1)
         if not armed:
