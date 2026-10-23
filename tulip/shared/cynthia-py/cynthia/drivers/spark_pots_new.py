@@ -339,6 +339,23 @@ class Driver:
                 # fault report, not noise.
                 self._pair_err[i] += 1
                 ang = self.values[i] * 360.0
+            elif self._anchor[i] is not None:
+                # Temporal plausibility. A pair can be individually valid yet
+                # still be a one-scan excursion (e.g. one wiper railed, the
+                # other momentarily touching), which made the displayed value
+                # twitch even though the delta guard stopped the parameter.
+                # Nothing a hand can do moves 90 deg in one 20ms scan.
+                dd = ang - self.values[i] * 360.0
+                if dd > 180.0:
+                    dd -= 360.0
+                elif dd < -180.0:
+                    dd += 360.0
+                if dd >= GLITCH_DEG or dd <= -GLITCH_DEG:
+                    self._glitches += 1
+                    ang = self.values[i] * 360.0
+                else:
+                    self._used0[i] = m0
+                    self._used1[i] = m1
             else:
                 self._used0[i] = m0
                 self._used1[i] = m1
@@ -355,12 +372,7 @@ class Driver:
                     d -= 360.0
                 elif d < -180.0:
                     d += 360.0
-                if d >= GLITCH_DEG or d <= -GLITCH_DEG:
-                    # Not a hand movement: reject, but keep the anchor where it
-                    # was so the next sane sample is measured from the last
-                    # good position.
-                    self._glitches += 1
-                elif d >= self._deadband or d <= -self._deadband:
+                if d >= self._deadband or d <= -self._deadband:
                     self._delta[i] += d / 360.0
                     self._has_delta = True
                     self._anchor[i] = ang
