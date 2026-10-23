@@ -57,7 +57,10 @@ DEADZONE_RAW = 100
 # Done in the ANGLE domain on purpose: the raw-count relationship is +-541.6
 # depending on which side of the wrap the wiper is on, so a modulo-1023 test is
 # wrong near 0/360.
-PAIR_TOL_DEG = 15.0
+# 20 deg: above the measured noise/spike amplitude so a normal turn is never
+# falsely rejected, far below the 140-175 deg disagreement a genuinely
+# mis-paired channel shows.
+PAIR_TOL_DEG = 20.0
 # Mux/counter settle times (from the prototype).
 MUX_SETTLE_US = 100
 ADC_SETTLE_US = 20
@@ -81,7 +84,13 @@ LED_EPSILON = 0.004
 # from accumulating into a slow drift while the knob sits still: the anchor only
 # advances when a step is emitted, so noise below the threshold is discarded
 # rather than integrated.
-DELTA_DEADBAND_DEG = 2.0
+# Measured on the sample board: the raw counts drift about +-10 (3.3 deg), so
+# peak-to-peak is ~6.6 deg. A 5 deg threshold sat inside that and emitted
+# spurious deltas while the knobs were untouched; 7 deg clears it while still
+# tracking a 90-degree turn to within 0.001 turns. Lower this
+# (rt.set_pot_deadband) once the panel is reflowed if the signal is clean -
+# every degree here is one degree of end-of-turn lag.
+DELTA_DEADBAND_DEG = 7.0
 
 # Rotation per scan that no hand can produce. At 50Hz a 90-degree step would be
 # 25 turns/second. Anything bigger is a sensing glitch (typically the two wipers
@@ -148,10 +157,14 @@ class Driver:
         self._delta = [0.0] * NUM_POTS     # pending turns since last read
         self._has_delta = False
         self._glitches = 0
+        self._stale = [False] * NUM_POTS   # waiting for a valid pair again
         self._pair_err = [0] * NUM_POTS   # rejected pair count per pot
         # Last raw pair actually used for each accepted angle (for debug output).
         self._used0 = [0] * NUM_POTS
         self._used1 = [0] * NUM_POTS
+        # Odd-indexed pots are mounted on the back of the board and turn the
+        # other way; flip their deltas so every knob feels the same.
+        self._reverse_odd = bool(cfg_entry.get("reverse_odd_pots", True))
         # Per-board override for noise hysteresis; see debug()/set_delta_deadband.
         try:
             self._deadband = float(cfg_entry.get("delta_deadband_deg",
@@ -332,19 +345,29 @@ class Driver:
             self._r0p1[i] = r0
             self._r1p2[i] = self._r1p1[i]
             self._r1p1[i] = r1
+
             ang = self._compute_angle(m0, m1)
+            resync = False
             if ang is None:
                 # Pair rejected: hold the last good angle so the knob does not
                 # jump, and count it. A climbing count for one pot is a hardware
                 # fault report, not noise.
                 self._pair_err[i] += 1
+                self._stale[i] = True
                 ang = self.values[i] * 360.0
+            elif self._stale[i]:
+                # RECOVERING from a bad stretch. Do not treat the catch-up as a
+                # glitch: holding here left the anchor behind, so every later
+                # sample also looked like a jump and the pot stayed stuck while
+                # the real value moved on (the "wiper stops tracking" symptom).
+                # Re-seed instead, and emit no delta for the jump.
+                self._stale[i] = False
+                resync = True
+                self._used0[i] = m0
+                self._used1[i] = m1
             elif self._anchor[i] is not None:
-                # Temporal plausibility. A pair can be individually valid yet
-                # still be a one-scan excursion (e.g. one wiper railed, the
-                # other momentarily touching), which made the displayed value
-                # twitch even though the delta guard stopped the parameter.
-                # Nothing a hand can do moves 90 deg in one 20ms scan.
+                # Temporal plausibility: nothing a hand can do moves 90 deg in
+                # one 20ms scan.
                 dd = ang - self.values[i] * 360.0
                 if dd > 180.0:
                     dd -= 360.0
@@ -352,6 +375,7 @@ class Driver:
                     dd += 360.0
                 if dd >= GLITCH_DEG or dd <= -GLITCH_DEG:
                     self._glitches += 1
+                    self._stale[i] = True
                     ang = self.values[i] * 360.0
                 else:
                     self._used0[i] = m0
@@ -359,23 +383,35 @@ class Driver:
             else:
                 self._used0[i] = m0
                 self._used1[i] = m1
+
             self.values[i] = ang / 360.0
-            # Relative mode: accumulate wrap-aware rotation in degrees, emitted
-            # in DELTA_DEADBAND_DEG steps from an anchor that only moves when a
-            # step is emitted.
+
+            if resync:
+                # Position jumped while the sensor was bad: take the new angle
+                # as the reference but do NOT turn it into parameter movement.
+                self._anchor[i] = ang
+                continue
+
             anchor = self._anchor[i]
             if anchor is None:
                 self._anchor[i] = ang
-            else:
-                d = ang - anchor
-                if d > 180.0:
-                    d -= 360.0
-                elif d < -180.0:
-                    d += 360.0
-                if d >= self._deadband or d <= -self._deadband:
-                    self._delta[i] += d / 360.0
-                    self._has_delta = True
-                    self._anchor[i] = ang
+                continue
+            d = ang - anchor
+            if d > 180.0:
+                d -= 360.0
+            elif d < -180.0:
+                d += 360.0
+            if d >= self._deadband or d <= -self._deadband:
+                turns = d / 360.0
+                # Odd-indexed pots sit on the back of the board, so their
+                # rotation is mechanically inverted. Flip the DELTA rather than
+                # the angle: the angle stays the physical position (what the
+                # scope and the pair checks reason about).
+                if self._reverse_odd and (i & 1):
+                    turns = -turns
+                self._delta[i] += turns
+                self._has_delta = True
+                self._anchor[i] = ang
         if self._leds and self._led_mode == "auto":
             self._update_leds_auto()
 

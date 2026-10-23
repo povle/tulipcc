@@ -480,6 +480,24 @@ Driver notes worth keeping:
   cannot reach the angle, and real movement passes through unchanged. Timing is
   tunable per board in `daughterboard.json` (`spi_baudrate`, `mux_settle_us`) if
   a panel turns out to be noisier than that.
+  **Thresholds are set from measured noise.** The panel drifts about +-10 raw
+  counts (3.3 deg), i.e. ~6.6 deg peak-to-peak, so `DELTA_DEADBAND_DEG` is 7
+  deg — a 5 deg threshold sat inside the drift and emitted deltas while the
+  knobs were untouched. `PAIR_TOL_DEG` is 20 deg: above the noise/spike
+  amplitude so a normal turn is never falsely rejected, far below the 140-175
+  deg disagreement a genuinely mis-paired channel shows. Both are tunable
+  (`rt.set_pot_deadband`, `delta_deadband_deg`); lower the deadband after a
+  reflow once the signal is clean, since every degree of deadband is a degree
+  of end-of-turn lag.
+  **Odd pots are mechanically reversed** (they sit on the back of the board):
+  `reverse_odd_pots` (default true) negates their deltas, so every knob turns
+  the same way. The delta is flipped rather than the angle, because the angle
+  stays the physical position the pair checks reason about.
+  **Recovery after a bad stretch resyncs instead of jumping.** When a pair is
+  rejected the value is held; on the next valid pair the position is adopted
+  and no delta is emitted. Holding instead (the earlier behaviour) left the
+  anchor behind, so every subsequent sample also looked like a jump and the pot
+  stayed stuck while the real value moved on.
   `GLITCH_DEG` (90) rejects movement no hand can produce (25 turns/s at 50Hz),
   so a broken board degrades to "knob does nothing" instead of slamming values.
 - The LED strip is optional and best-effort: a missing `neopixel` module or an
