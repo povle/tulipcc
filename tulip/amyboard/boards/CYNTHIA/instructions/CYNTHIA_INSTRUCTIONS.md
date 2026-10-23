@@ -446,7 +446,8 @@ Driver notes worth keeping:
   rt.trace_pot(0, 40)      # sample P01 while turning it
   rt.pot_glitches()        # samples rejected as impossible rotation
   rt.set_pot_deadband(6)   # more hysteresis, live
-  rt.pot_debug(0)          # on-screen scope for one pot
+  rt.pot_debug(0)          # on-screen scope for one pot (also Settings >
+                           # Pots debug, which returns there on exit)
   ```
   The scope draws both raw wiper channels as bars (filtered values, with the
   raw counts printed under them), ticks at the raw count the second wiper

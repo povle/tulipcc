@@ -1565,6 +1565,7 @@ def _settings_rows():
         ("ble_name", "choice", "ble_name"),
         ("ble_status", "info", "ble_status"),
         ("pots", "action", "pots"),
+        ("pot_debug", "action", "pot_debug"),
         ("calibrate", "action", "calibrate"),
         ("back", "back", "back"),
     ]
@@ -1649,6 +1650,11 @@ def _settings_step(key, kind, delta):
         if key == "pots":
             close_settings()
             open_pots()
+            return
+        if key == "pot_debug":
+            # Live two-channel scope for one pot; stick up/down picks the pot.
+            close_settings()
+            open_pot_debug(0, back="settings")
             return
         if key == "calibrate":
             # Leave the settings screen first: calibration owns the display and
@@ -1808,6 +1814,7 @@ _pots_sel = 0            # physical pot under the cursor while editing
 # glance instead of being inferred from numbers.
 _pots_debug = False
 _pot_dbg_sel = 0
+_pot_dbg_back = None   # screen to return to on exit ("settings" or None)
 
 
 def _pot_driver():
@@ -1818,9 +1825,14 @@ def _pot_driver():
     return None
 
 
-def open_pot_debug(pot=0):
-    """Show the two raw channels of physical pot `pot` (0-based)."""
-    global _pots_debug, _pot_dbg_sel, _pots_active, _pots_edit
+def open_pot_debug(pot=0, back=None):
+    """Show the two raw channels of physical pot `pot` (0-based).
+
+    `back` names the screen to return to on exit (the settings app passes
+    "settings"), so leaving the scope does not dump you into PLAY.
+    """
+    global _pots_debug, _pot_dbg_sel, _pots_active, _pots_edit, _pot_dbg_back
+    _pot_dbg_back = back
     # Screens are mutually exclusive; the scope replaces whatever was up.
     _pots_active = False
     _pots_edit = False
@@ -1833,9 +1845,14 @@ def open_pot_debug(pot=0):
 
 
 def close_pot_debug():
-    global _pots_debug
+    global _pots_debug, _pot_dbg_back
     _pots_debug = False
     _joy_reset()
+    back = _pot_dbg_back
+    _pot_dbg_back = None
+    if back == "settings":
+        open_settings()
+        return
     _draw_ui(force=True)
 
 
