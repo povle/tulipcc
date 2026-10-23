@@ -1124,6 +1124,9 @@ def _poll_body(tick):
     elif _pots_active and _pots_edit:
         if joy is not None:
             _handle_joystick_pots(jx, jy)
+    elif _pots_debug:
+        if joy is not None:
+            _handle_joystick_pot_debug(jx, jy)
 
     # Hold gestures (chords and axis holds). Single-button holds arrive as
     # long_press events from the C input task; these cover what an event
@@ -1168,6 +1171,12 @@ def _poll_body(tick):
 
     _maybe_start_ble(now)
 
+    if _pots_debug and (_tick % 10) == 0:
+        # Realtime scope at ~10Hz. The limit is the panel, not the sampling: one
+        # full 128x64 SH1106 push is ~23ms of I2C (8 pages x 129 bytes at
+        # 400kHz), so repainting faster would spend more than half the frame on
+        # the bus and starve the poll. Sampling still runs at the driver's 50Hz.
+        mark_dirty()
     if _pots_active and (_tick % 12) == 0:
         # Live bars: ~8Hz is plenty and keeps I2C traffic modest.
         mark_dirty()
@@ -1324,6 +1333,15 @@ def _handle_event(ev):
             # Any button leaves the pots screen (edit mode saves first).
             close_pots()
             return
+        if _pots_debug:
+            global _pot_dbg_sel
+            if kind == "short_press" and idx == 4:
+                close_pot_debug()
+            elif kind == "short_press":
+                step = -1 if idx in (BTN_OCTAVE_DOWN, BTN_PATCH_PREV) else 1
+                _pot_dbg_sel = max(0, min(15, _pot_dbg_sel + step))
+                _draw_ui(force=True)
+            return
         if _local_active:
             if kind == "short_press" and idx == 4:
                 _local_activate()
@@ -1355,7 +1373,9 @@ def _handle_event(ev):
                                        or _save_menu_active or _patch_list_active):
                     open_pots()
                     return
-            if _local_active:
+            if _pots_debug:
+                close_pot_debug()
+            elif _local_active:
                 close_local_settings()
             elif _pots_active:
                 close_pots()
@@ -1780,6 +1800,142 @@ _pots_edit = False       # opened from local settings: assignments are editable
 _pots_sel = 0            # physical pot under the cursor while editing
 
 
+
+# --- Pot channel scope ------------------------------------------------------
+# Full-panel view of ONE pot's two wiper channels, for chasing a bad board.
+# Shows both raw counts as bars, the raw count the second wiper SHOULD have
+# (180 degrees away), and the resulting error - so a broken pair is visible at a
+# glance instead of being inferred from numbers.
+_pots_debug = False
+_pot_dbg_sel = 0
+
+
+def _pot_driver():
+    from . import registry
+    for d in registry.drivers().values():
+        if hasattr(d, "debug"):
+            return d
+    return None
+
+
+def open_pot_debug(pot=0):
+    """Show the two raw channels of physical pot `pot` (0-based)."""
+    global _pots_debug, _pot_dbg_sel, _pots_active, _pots_edit
+    # Screens are mutually exclusive; the scope replaces whatever was up.
+    _pots_active = False
+    _pots_edit = False
+    _pots_debug = True
+    _pot_dbg_sel = max(0, min(15, int(pot)))
+    _joy_reset()
+    print("cynthia: pot scope P%02d — stick up/down selects, click exits"
+          % (_pot_dbg_sel + 1))
+    _draw_ui(force=True)
+
+
+def close_pot_debug():
+    global _pots_debug
+    _pots_debug = False
+    _joy_reset()
+    _draw_ui(force=True)
+
+
+def is_pot_debug_active():
+    return _pots_debug
+
+
+def pot_debug(pot=0):
+    """REPL alias: show pot `pot` on screen."""
+    open_pot_debug(pot)
+
+
+def _expected_wiper1(raw0):
+    """Raw count wiper 1 should read when wiper 0 reads `raw0`.
+
+    The wipers are 180 deg apart on a 340 deg track, i.e. +-541.6 counts. Pick
+    whichever candidate lands inside the ADC range (both cannot).
+    """
+    off = (180.0 / 340.0) * 1023.0
+    a = raw0 - off
+    b = raw0 + off
+    if 0 <= a <= 1023:
+        return a
+    if 0 <= b <= 1023:
+        return b
+    return a if abs(raw0 - a) < abs(raw0 - b) else b
+
+
+def _draw_raw_row(disp, y, label, value, tick=None, tick2=None):
+    """One bar row: label, 4-digit value, 0..1023 bar, optional ticks."""
+    disp.draw_str(display.FONT_5X7, 2, y + 5, label, 1)
+    txt = str(value)
+    disp.draw_str(display.FONT_5X7, max(12, 38 - disp.str_width(display.FONT_5X7, txt)),
+                  y + 5, txt, 1)
+    bx, bw, bh = 42, 84, 5
+    disp.rect(bx, y, bw, bh, 1)
+    span = bw - 2
+    w = int(span * (value / 1023.0))
+    if w > 0:
+        disp.fill_rect(bx + 1, y + 1, w, bh - 2, 1)
+    for tv in (tick, tick2):
+        if tv is None:
+            continue
+        tx = bx + 1 + int(span * (tv / 1023.0))
+        if bx <= tx <= bx + bw - 1:
+            disp.vline(tx, y - 1, bh + 2, 1)
+
+
+def _draw_pot_debug(disp):
+    drv = _pot_driver()
+    title = "P%02d ADC" % (_pot_dbg_sel + 1)
+    tw = disp.str_width(display.FONT_5X7, title)
+    disp.draw_str(display.FONT_5X7, max(0, (128 - tw) // 2), 8, title, 1)
+    disp.hline(0, 10, 128, 1)
+    if drv is None:
+        disp.draw_str(display.FONT_5X7, 4, 30, "no pot board", 1)
+        return
+
+    row = drv.debug()[_pot_dbg_sel]
+    _i, r0, r1, f0, f1, ang, perr = row
+    exp = _expected_wiper1(r0)
+    # Bars show the FILTERED values (what the angle is computed from); the raw
+    # number is printed too so a filter-vs-raw difference is obvious.
+    _draw_raw_row(disp, 13, "0", f0 if f0 else r0)
+    _draw_raw_row(disp, 23, "1", f1 if f1 else r1,
+                  tick=exp - 80, tick2=exp + 80)
+
+    # Error of the actual second wiper against the expected one.
+    err = r1 - exp
+    if err > 511.5:
+        err -= 1083.0
+    elif err < -511.5:
+        err += 1083.0
+    lines = [
+        "exp %4d" % exp,
+        "raw %4d/%4d" % (r0, r1),
+        "pos %6.1f" % ang,
+        "err %+5.0f rej %d" % (err, perr),
+    ]
+    y = 34
+    for ln in lines:
+        disp.draw_str(display.FONT_5X7, 2, y, disp.fit_text(display.FONT_5X7, ln, 124), 1)
+        y += 8
+
+
+def _handle_joystick_pot_debug(jx, jy):
+    global _pot_dbg_sel
+    now = time.ticks_ms()
+    d = _joy_axis(1, jy, now)
+    if d:
+        new = _pot_dbg_sel - d
+        if new < 0:
+            new = 0
+        elif new > 15:
+            new = 15
+        if new != _pot_dbg_sel:
+            _pot_dbg_sel = new
+            _draw_ui(force=True)
+
+
 def open_pots(edit=False):
     global _pots_active, _pots_edit, _pots_sel
     _pots_active = True
@@ -2138,6 +2294,10 @@ def _draw_ui(force=False):
 
     # The pots and local-settings screens are full-panel views (they draw their
     # own titles), so they must not sit under the normal header.
+    if _pots_debug:
+        _draw_pot_debug(disp)
+        disp.show()
+        return
     if _local_active:
         _draw_local_ui(disp)
         disp.show()

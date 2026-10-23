@@ -446,7 +446,16 @@ Driver notes worth keeping:
   rt.trace_pot(0, 40)      # sample P01 while turning it
   rt.pot_glitches()        # samples rejected as impossible rotation
   rt.set_pot_deadband(6)   # more hysteresis, live
+  rt.pot_debug(0)          # on-screen scope for one pot
   ```
+  The scope draws both raw wiper channels as bars (filtered values, with the
+  raw counts printed under them), ticks at the raw count the second wiper
+  should have (that 180-degree offset, +/- the tolerance band), plus the
+  resulting error and the rejection count for that pot. A pair is healthy when
+  the second bar's filled end sits between the two ticks and `err` stays near
+  zero. It refreshes at ~10Hz: one full SH1106 push is ~23ms of I2C, so a
+  faster scope would spend more than half the frame on the bus. Sampling still
+  runs at the driver's 50Hz.
   `raw0`/`raw1` steady while the angle leaps → software (reconciler). Raw
   columns wandering → sensing (mux/wiring/noise). A glitch count that climbs
   with nobody touching the panel is the signature of the two wipers being
