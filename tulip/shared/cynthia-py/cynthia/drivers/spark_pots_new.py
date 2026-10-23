@@ -65,6 +65,12 @@ LED_EPSILON = 0.004
 # rather than integrated.
 DELTA_DEADBAND_DEG = 2.0
 
+# Rotation per scan that no hand can produce. At 50Hz a 90-degree step would be
+# 25 turns/second. Anything bigger is a sensing glitch (typically the two wipers
+# being reconciled 180 degrees apart), so it is dropped and counted instead of
+# slammed into a parameter. `debug()` exposes the count.
+GLITCH_DEG = 90.0
+
 
 def _ticks_diff(a, b):
     """Wrap-safe tick difference."""
@@ -99,6 +105,13 @@ class Driver:
         self._anchor = [None] * NUM_POTS   # last angle a delta was emitted at
         self._delta = [0.0] * NUM_POTS     # pending turns since last read
         self._has_delta = False
+        self._glitches = 0
+        # Per-board override for noise hysteresis; see debug()/set_delta_deadband.
+        try:
+            self._deadband = float(cfg_entry.get("delta_deadband_deg",
+                                                 DELTA_DEADBAND_DEG))
+        except (TypeError, ValueError):
+            self._deadband = DELTA_DEADBAND_DEG
         # Last values the LED strip was told about. A 16-LED WS2812 write is
         # ~0.5ms of blocking, so pushing every scan (50Hz) wasted 2.5% of the
         # frame to redraw colours that had not changed.
@@ -260,7 +273,12 @@ class Driver:
                     d -= 360.0
                 elif d < -180.0:
                     d += 360.0
-                if d >= DELTA_DEADBAND_DEG or d <= -DELTA_DEADBAND_DEG:
+                if d >= GLITCH_DEG or d <= -GLITCH_DEG:
+                    # Not a hand movement: reject, but keep the anchor where it
+                    # was so the next sane sample is measured from the last
+                    # good position.
+                    self._glitches += 1
+                elif d >= self._deadband or d <= -self._deadband:
                     self._delta[i] += d / 360.0
                     self._has_delta = True
                     self._anchor[i] = ang
@@ -289,6 +307,32 @@ class Driver:
     def knobs(self):
         """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
         return self.values
+
+    def debug(self):
+        """Per-pot (index, raw0, raw1, angle_deg) for diagnosing a bad board.
+
+        raw0/raw1 are the two wiper ADC counts (0..1023) and angle_deg is the
+        reconciled 0..360 position. If the raws are stable but the angle jumps,
+        the reconciler is at fault (software); if the raws themselves jump, it is
+        the sensing (hardware/noise/mux).
+        """
+        out = []
+        for i in range(NUM_POTS):
+            out.append((i, self._phase0[i], self._phase1[i],
+                        round(self.values[i] * 360.0, 1)))
+        return out
+
+    def set_delta_deadband(self, deg):
+        """Change the rotation hysteresis at runtime (diagnostic aid)."""
+        self._deadband = float(deg)
+        return self._deadband
+
+    def delta_deadband(self):
+        return self._deadband
+
+    def glitch_count(self):
+        """Samples rejected as impossible movement (see GLITCH_DEG)."""
+        return self._glitches
 
     def knob_deltas(self):
         """Rotation since the last call: [(pot_index, turns)]. Deltas are

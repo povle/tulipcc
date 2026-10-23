@@ -438,6 +438,21 @@ Driver notes worth keeping:
   that stops wiper noise from integrating into a slow drift — measured: 100
   scans of ±1-degree jitter emit nothing. Wrap is handled, so 355°→5° is +10°,
   not -350°. Engines without `get_pot` fall back to absolute+pickup.
+- **When the knobs jump**, split software from hardware at the REPL:
+  ```
+  import cynthia.runtime as rt
+  rt.set_solo_pots([0])    # only P01 applied
+  rt.pots_report()         # raw0/raw1/angle for every pot
+  rt.trace_pot(0, 40)      # sample P01 while turning it
+  rt.pot_glitches()        # samples rejected as impossible rotation
+  rt.set_pot_deadband(6)   # more hysteresis, live
+  ```
+  `raw0`/`raw1` steady while the angle leaps → software (reconciler). Raw
+  columns wandering → sensing (mux/wiring/noise). A glitch count that climbs
+  with nobody touching the panel is the signature of the two wipers being
+  reconciled ~180 degrees apart, i.e. wrong pairing rather than noise.
+  `GLITCH_DEG` (90) rejects movement no hand can produce (25 turns/s at 50Hz),
+  so a broken board degrades to "knob does nothing" instead of slamming values.
 - The LED strip is optional and best-effort: a missing `neopixel` module or an
   unpopulated strip logs a warning and leaves the pots working. `neopixel` is
   frozen in `boards/manifest.py` so it is available offline.

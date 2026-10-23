@@ -81,11 +81,111 @@ _POT_NAME_KEYS = [
 # value for that parameter at every patch/instrument change.
 _rel_pots = False
 _pot_pos = [0.5] * 16
+# Diagnostic: only these physical pots are applied (None = all). Lets you
+# isolate one pot without touching the knob map, e.g. set_solo_pots([0]).
+_active_pots = None
 
 PICKUP_EPS = 0.03
 _pot_armed = [True] * 16
 _pot_base = [0.0] * 16
 _pot_count = 16
+
+
+def set_solo_pots(pots):
+    """Only apply these physical pot indices (None/[] = all).
+
+    Diagnostic switch for chasing noise or a bad mux channel: with one pot
+    active, a jump can only come from that pot's own two wipers.
+    """
+    global _active_pots
+    if not pots:
+        _active_pots = None
+    else:
+        _active_pots = set(int(p) for p in pots)
+    print("cynthia: active pots =", "all" if _active_pots is None else sorted(_active_pots))
+    return _active_pots
+
+
+def active_pots():
+    return _active_pots
+
+
+def pots_report():
+    """Print raw wiper counts and the reconciled angle for every pot.
+
+    Raw values stable + angle jumping  -> software (reconciler/threshold).
+    Raw values themselves jumping      -> hardware (sensor, mux, wiring, noise).
+    """
+    from . import registry
+    drv = None
+    for d in registry.drivers().values():
+        if hasattr(d, "debug"):
+            drv = d
+            break
+    if drv is None:
+        print("cynthia: no pot board driver with debug()")
+        return
+    print("pot  raw0  raw1  angle~deg   applied")
+    act = _active_pots
+    for i, r0, r1, ang in drv.debug():
+        on = "yes" if (act is None or i in act) else "no"
+        print("P%02d %5d %5d %8.1f   %s" % (i + 1, r0, r1, ang, on))
+    if hasattr(drv, "delta_deadband"):
+        print("deadband: %.1f deg" % drv.delta_deadband())
+
+
+def set_pot_deadband(deg):
+    """Tune rotation hysteresis at runtime (higher = more noise immunity)."""
+    from . import registry
+    for d in registry.drivers().values():
+        if hasattr(d, "set_delta_deadband"):
+            print("cynthia: pot deadband now %.1f deg" % d.set_delta_deadband(deg))
+            return
+    print("cynthia: no pot board with a deadband")
+
+
+def pot_glitches():
+    """Count of samples rejected as impossible rotation (see GLITCH_DEG).
+
+    Climbing quickly while the knobs are untouched means the angle is flipping,
+    which is a sensing/mapping problem rather than noise.
+    """
+    from . import registry
+    for d in registry.drivers().values():
+        if hasattr(d, "glitch_count"):
+            n = d.glitch_count()
+            print("cynthia: pot glitches =", n)
+            return n
+    print("cynthia: no pot board with glitch counting")
+    return 0
+
+
+def trace_pot(ch, n=40, delay_ms=50):
+    """Sample one physical pot and print its two raw wipers + angle.
+
+    Scans directly (the UI poll is blocked while this runs), so you can turn
+    the pot by hand and watch both wipers ramp. At rest the raw columns should
+    be steady; if they wander by tens of counts, the sensing is noisy. If the
+    raws ramp smoothly but the angle leaps, the reconciler is at fault.
+    """
+    from . import registry
+    drv = None
+    for d in registry.drivers().values():
+        if hasattr(d, "debug"):
+            drv = d
+            break
+    if drv is None:
+        print("cynthia: no pot board driver")
+        return
+    print("tracing pot P%02d (%d samples, %dms) — turn it slowly, then leave it still"
+          % (ch + 1, n, delay_ms))
+    print("  #   raw0  raw1  angle~deg")
+    for k in range(n):
+        drv.scan()
+        row = drv.debug()[ch]
+        _i, r0, r1, ang = row
+        print("%3d  %5d %5d %8.1f" % (k, r0, r1, ang))
+        time.sleep_ms(delay_ms)
 
 
 def _clamp01(v):
@@ -145,6 +245,8 @@ def _apply_knob_deltas(now):
     global _last_knob_ch, _last_knob_time
     for ch, d in surface.knob_deltas():
         if ch < 0 or ch >= 16:
+            continue
+        if _active_pots is not None and ch not in _active_pots:
             continue
         target = _knob_map[ch] if ch < len(_knob_map) else ch
         p = _pot_pos[ch] + d
@@ -955,6 +1057,8 @@ def _poll_body(tick):
             _apply_knob_deltas(now)
         else:
             for ch, v in surface.knob_changes():
+                if _active_pots is not None and ch not in _active_pots:
+                    continue
                 # Pickup: a freshly loaded patch owns its parameters until the
                 # player actually moves this control.
                 if ch < len(_pot_armed) and not _pot_armed[ch]:
