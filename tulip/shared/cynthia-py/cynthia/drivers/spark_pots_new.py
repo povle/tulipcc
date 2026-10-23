@@ -39,7 +39,25 @@ NUM_POTS = 16
 # 360 deg 2-phase). The two wipers are offset 180 deg.
 WIPER_RANGE_DEG = 340.0
 # Raw-counts threshold for deadzone detection (wiper near the ADC rails).
-DEADZONE_RAW = 60
+#
+# A wiper is non-linear at the ends of its 340-degree track, so the outer ~10%
+# of its span is not trustworthy as an angle source. 60 counts (6%) was too
+# tight: a wiper reading 961 is 62 counts from the rail — inside its own
+# non-linear region — yet counted as "good", so when its partner was railed the
+# code trusted the bad one and produced a stable-but-wrong angle.
+DEADZONE_RAW = 100
+
+# While BOTH wipers are on-track they describe the same physical angle, 180 deg
+# apart, so their two estimates must agree. Mechanical play and wiper tolerance
+# are a few degrees; a disagreement of tens of degrees means the channels are
+# reading different sensors (bad mux address bit, floating/crosstalk channel,
+# broken wiper). Such samples are rejected rather than reconciled into a
+# plausible but wrong angle, which is what made a bad pot jump.
+#
+# Done in the ANGLE domain on purpose: the raw-count relationship is +-541.6
+# depending on which side of the wrap the wiper is on, so a modulo-1023 test is
+# wrong near 0/360.
+PAIR_TOL_DEG = 15.0
 # Mux/counter settle times (from the prototype).
 MUX_SETTLE_US = 100
 ADC_SETTLE_US = 20
@@ -130,6 +148,10 @@ class Driver:
         self._delta = [0.0] * NUM_POTS     # pending turns since last read
         self._has_delta = False
         self._glitches = 0
+        self._pair_err = [0] * NUM_POTS   # rejected pair count per pot
+        # Last raw pair actually used for each accepted angle (for debug output).
+        self._used0 = [0] * NUM_POTS
+        self._used1 = [0] * NUM_POTS
         # Per-board override for noise hysteresis; see debug()/set_delta_deadband.
         try:
             self._deadband = float(cfg_entry.get("delta_deadband_deg",
@@ -240,18 +262,24 @@ class Driver:
         ang1 = (raw1 / 1023.0) * WIPER_RANGE_DEG + 180.0   # 180..520
         if ang1 >= 360.0:
             ang1 -= 360.0
-        # Do the two angles agree (within 2 deg, wrap-aware)?
+        # A dead wiper reads near the ADC rails.
+        w0_rails = raw0 < DEADZONE_RAW or raw0 > (1023 - DEADZONE_RAW)
+        w1_rails = raw1 < DEADZONE_RAW or raw1 > (1023 - DEADZONE_RAW)
+        # Wrap-aware disagreement between the two estimates of the same angle.
         diff = ang1 - ang0
         if diff > 180.0:
             diff -= 360.0
         elif diff < -180.0:
             diff += 360.0
+        # Both wipers on-track: a large disagreement cannot be mechanical play,
+        # so the pair is reading different sensors. Reject before reconciling.
+        if not w0_rails and not w1_rails:
+            if diff > PAIR_TOL_DEG or diff < -PAIR_TOL_DEG:
+                return None
+        # Do the two angles agree closely (within 2 deg)?
         if diff < 2.0 and diff > -2.0:
             return ang0 + diff * 0.5
-        # Disagree: one wiper is in its deadzone. A dead wiper reads near the
-        # ADC rails.
-        w0_rails = raw0 < DEADZONE_RAW or raw0 > (1023 - DEADZONE_RAW)
-        w1_rails = raw1 < DEADZONE_RAW or raw1 > (1023 - DEADZONE_RAW)
+        # Disagree: one wiper is in its deadzone.
         if w0_rails and not w1_rails:
             return ang1
         if w1_rails and not w0_rails:
@@ -276,7 +304,9 @@ class Driver:
                 d180 = -d180
             dist1 = d160 if d160 < d180 else d180
             return ang0 if dist0 > dist1 else ang1
-        return ang0  # both near rails (shouldn't happen); fall back
+        # Both wipers in (or near) their dead zones. At a genuine boundary angle
+        # only ONE wiper is dead, so this is a corrupt pair, not a position.
+        return None
 
     # --- scan ---
 
@@ -303,6 +333,15 @@ class Driver:
             self._r1p2[i] = self._r1p1[i]
             self._r1p1[i] = r1
             ang = self._compute_angle(m0, m1)
+            if ang is None:
+                # Pair rejected: hold the last good angle so the knob does not
+                # jump, and count it. A climbing count for one pot is a hardware
+                # fault report, not noise.
+                self._pair_err[i] += 1
+                ang = self.values[i] * 360.0
+            else:
+                self._used0[i] = m0
+                self._used1[i] = m1
             self.values[i] = ang / 360.0
             # Relative mode: accumulate wrap-aware rotation in degrees, emitted
             # in DELTA_DEADBAND_DEG steps from an anchor that only moves when a
@@ -362,8 +401,13 @@ class Driver:
         out = []
         for i in range(NUM_POTS):
             out.append((i, self._phase0[i], self._phase1[i],
-                        round(self.values[i] * 360.0, 1)))
+                        self._used0[i], self._used1[i],
+                        round(self.values[i] * 360.0, 1), self._pair_err[i]))
         return out
+
+    def pair_errors(self, pot):
+        """Pairs rejected for `pot` (see PAIR_OFFSET_RAW)."""
+        return self._pair_err[pot]
 
     def timing(self):
         """(spi_baudrate, mux_settle_us) currently in use."""

@@ -451,6 +451,18 @@ Driver notes worth keeping:
   columns wandering → sensing (mux/wiring/noise). A glitch count that climbs
   with nobody touching the panel is the signature of the two wipers being
   reconciled ~180 degrees apart, i.e. wrong pairing rather than noise.
+  **Wiper pairs are validated before reconciliation.** While both wipers are
+  on-track they describe the same physical angle 180 degrees apart, so their two
+  estimates must agree; a disagreement over `PAIR_TOL_DEG` (15) cannot be
+  mechanical play and means the channels are reading different sensors. Checked
+  in the ANGLE domain, not raw counts: the raw offset is +-541.6 depending on
+  which side of the wrap the wiper is on, so a modulo-1023 test is wrong near
+  0/360 (that mistake rejected valid samples during bring-up). A rejected pair
+  holds the last good angle and increments a per-pot counter, and when both
+  wipers sit in their dead zone the sample is rejected too (at a genuine
+  boundary only ONE wiper is dead). `DEADZONE_RAW` is 100 counts: a wiper 60
+  counts from the rail is already non-linear, and treating it as a trustworthy
+  angle source produced a stable-but-wrong reading on a bad pot.
   **Isolated bad reads are the dominant failure mode** on the sample board: a
   trace showed the two wipers agreeing within 0.1-5 degrees almost every sample,
   with occasional single samples where one wiper was stale (raw1 ~500 when it

@@ -125,11 +125,13 @@ def pots_report():
     if drv is None:
         print("cynthia: no pot board driver with debug()")
         return
-    print("pot  raw0  raw1  angle~deg   applied")
+    print("pot   raw0 raw1   used0 used1   angle  rejected  applied")
     act = _active_pots
-    for i, r0, r1, ang in drv.debug():
+    for row in drv.debug():
+        i, r0, r1, f0, f1, ang, perr = row
         on = "yes" if (act is None or i in act) else "no"
-        print("P%02d %5d %5d %8.1f   %s" % (i + 1, r0, r1, ang, on))
+        print("P%02d  %4d %4d   %4d %4d  %6.1f  %8d   %s"
+              % (i + 1, r0, r1, f0, f1, ang, perr, on))
     if hasattr(drv, "delta_deadband"):
         print("deadband: %.1f deg" % drv.delta_deadband())
     if hasattr(drv, "timing"):
@@ -184,12 +186,12 @@ def trace_pot(ch, n=40, delay_ms=50):
         return
     print("tracing pot P%02d (%d samples, %dms) — turn it slowly, then leave it still"
           % (ch + 1, n, delay_ms))
-    print("  #   raw0  raw1  angle~deg")
+    print("  #   raw0 raw1   used0 used1   angle  rej")
     for k in range(n):
         drv.scan()
-        row = drv.debug()[ch]
-        _i, r0, r1, ang = row
-        print("%3d  %5d %5d %8.1f" % (k, r0, r1, ang))
+        _i, r0, r1, f0, f1, ang, perr = drv.debug()[ch]
+        print("%3d  %4d %4d   %4d %4d  %6.1f  %3d"
+              % (k, r0, r1, f0, f1, ang, perr))
         time.sleep_ms(delay_ms)
 
 
