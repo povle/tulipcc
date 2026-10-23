@@ -16,6 +16,10 @@ require("webrepl")  # WebREPL server (REPL over WiFi); _webrepl C module is enab
 require("dht")
 require("ds18x20")
 require("onewire")
+# Optional NeoPixel strip on the new pot board (cynthia/drivers/spark_pots_new.py).
+# Only imported when daughterboard.json declares "leds"; frozen so it works
+# offline.
+require("neopixel")
 # NOTE: no aioble. cynthia/ble_midi.py talks to the raw `bluetooth` module:
 # aioble is asyncio-based and nothing runs an event loop on CYNTHIA, so an
 # aioble advertising task was scheduled and never executed (the radio stayed

@@ -410,6 +410,28 @@ Hardware:
 Capabilities: `knobs` (16), `leds`. **Tightest poll path** (§8) — hardware SPI, zero-alloc
 scan, scheduler-paced.
 
+**This is the stock board as of config revision 2.** `cynthia/config.py` seeds
+`slot1: spark_pots_new` and `_migrate()` upgrades a previously seeded
+`daughterboard.json` once (only if the driver name is still the old stock
+`spark_pots_legacy`; a hand-picked driver is never overwritten).
+
+Driver notes worth keeping:
+- MCP3002 framing is a **leading don't-care DIN bit**, then start/SGL/ODD/MSBF
+  (hence 0x68/0x78), and the first received byte is `xxxxx null B9 B8`
+  (datasheet Fig. 6-1). That is why the parse is `((rx[0] & 3) << 8) | rx[1]`.
+- The wiper that is not near an ADC rail is chosen by its distance to the
+  **nearest** dead zone: wiper 0's are at both ends of its 340° travel, wiper
+  1's at 160°/180° after the 180° offset. Measuring wiper 0 only from the 340°
+  end picks a noisy value when it sits just off raw=0.
+- NeoPixel writes happen only when a pot moves past `LED_EPSILON`; a 16-LED
+  WS2812 push is ~0.5 ms of blocking, so redrawing unchanged colours at the
+  50 Hz scan rate burned ~2.5% of the frame.
+- `stop()` deinits the SPI host: `machine.SPI(id)` cannot be created twice, so
+  a driver reload otherwise fails with "SPI host already in use".
+- The LED strip is optional and best-effort: a missing `neopixel` module or an
+  unpopulated strip logs a warning and leaves the pots working. `neopixel` is
+  frozen in `boards/manifest.py` so it is available offline.
+
 ### 10.3 `drivers/spark_pots_legacy.py` — Spark pot board (legacy)
 Hardware:
 - **16 regular pots** multiplexed into the **mainboard ADS** (uses 1 slot ADS channel); the

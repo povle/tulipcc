@@ -30,10 +30,19 @@ DEFAULTS = {
 #   slot1 = hardware slot 2 (IO_x_2) -> spark_pots_legacy 16-pot board
 # (spark_pots_legacy's mux address lines are IO_A_2..IO_D_2 and its mux
 # output feeds slot 1's analog pin A = ADS AIN2, matching pins.py slot 1.)
+#
+# slot1: the NEW two-wiper endless-pot board (MCP3002 + counter). The previous
+# stock board (ADS + 4-GPIO mux, `spark_pots_legacy`) is still available by
+# setting the driver name by hand; see CONFIG_REVISION below.
 DEFAULT_SLOTS = {
     "slot0": {"driver": "spark_main"},
-    "slot1": {"driver": "spark_pots_legacy"},
+    "slot1": {"driver": "spark_pots_new"},
 }
+
+# Bumped when the stock hardware changes. An older seeded file is migrated
+# once; a driver name the user chose by hand is never rewritten afterwards
+# (the revision is stored, so the migration runs only for revision < this).
+CONFIG_REVISION = 2
 
 
 def load():
@@ -64,11 +73,45 @@ def seed_default():
     registry.start() so the drivers actually come up on a new board."""
     try:
         open(CONFIG_PATH).close()
-        return  # already exists — user config is authoritative
+        # Already exists: upgrade it if it was seeded by an older stock
+        # revision. Without this, a board that booted once keeps the old driver
+        # name forever and the new pot board silently does nothing.
+        _migrate()
+        return
     except OSError:
         pass
-    save({"adc_chip": DEFAULTS["adc_chip"], "slots": DEFAULT_SLOTS})
-    print("cynthia: wrote default daughterboard.json (spark_main + spark_pots_legacy)")
+    save({"adc_chip": DEFAULTS["adc_chip"], "slots": DEFAULT_SLOTS,
+          "revision": CONFIG_REVISION})
+    print("cynthia: wrote default daughterboard.json (spark_main + spark_pots_new)")
+
+
+def _migrate():
+    """One-time upgrade of a config seeded by an older stock revision."""
+    import json
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("revision", 1) >= CONFIG_REVISION:
+        return
+    slots = data.get("slots")
+    if not isinstance(slots, dict):
+        slots = {}
+        data["slots"] = slots
+    slot1 = slots.get("slot1")
+    if not isinstance(slot1, dict):
+        slot1 = {}
+    # Only swap the OLD STOCK driver. Anything else is a deliberate choice.
+    if slot1.get("driver", "spark_pots_legacy") == "spark_pots_legacy":
+        slot1 = dict(slot1)
+        slot1["driver"] = "spark_pots_new"
+        slots["slot1"] = slot1
+        print("cynthia: daughterboard.json slot1 -> spark_pots_new (new pot board)")
+    data["revision"] = CONFIG_REVISION
+    save(data)
 
 
 def driver_for(cfg, slot_id):

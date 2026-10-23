@@ -48,15 +48,13 @@ ADC_SETTLE_US = 20
 # poll's budget is ~10ms, so scanning every poll burned ~37% of it. 20ms (50Hz)
 # is far faster than a hand can turn a pot and leaves the poll responsive.
 SCAN_PERIOD_MS = 20
+# Pot movement that justifies rewriting the LED strip (see _update_leds_auto).
+LED_EPSILON = 0.004
 
 
 def _ticks_diff(a, b):
-    """Wrap-safe difference using MicroPython's ticks_diff when available."""
-    try:
-        import time as _t
-        return _t.ticks_diff(a, b)
-    except Exception:
-        return a - b
+    """Wrap-safe tick difference."""
+    return time.ticks_diff(a, b)
 
 # MUX0_MAP[addr] = sensor number (1-based) routed to MCP3002 CH0 (phase 0)
 # MUX1_MAP[addr] = sensor number (1-based) routed to MCP3002 CH1 (phase 1)
@@ -83,6 +81,10 @@ class Driver:
         self._rx = bytearray(2)
         # Knob values 0..1 (angle / 360), exposed via knobs().
         self.values = [0.0] * NUM_POTS
+        # Last values the LED strip was told about. A 16-LED WS2812 write is
+        # ~0.5ms of blocking, so pushing every scan (50Hz) wasted 2.5% of the
+        # frame to redraw colours that had not changed.
+        self._led_shown = [None] * NUM_POTS
         self._last_scan_ms = None
         # NeoPixels (optional, §10.2) — only if configured.
         self._leds = None
@@ -102,12 +104,28 @@ class Driver:
         time.sleep_ms(10)  # supply ramp for muxes/ADC (from the prototype)
         led_cfg = self.cfg.get("leds")
         if led_cfg:
-            import neopixel
-            n = led_cfg.get("count", NUM_POTS)
-            self._leds = neopixel.NeoPixel(
-                self.slot.pin(led_cfg.get("pin", "E"), machine.Pin.OUT), n)
+            # LEDs are optional. A missing module, a wrong pin or an unpopulated
+            # strip must leave the pots working, so this is best-effort: losing
+            # the whole driver over a decorative feature is a bad trade.
+            try:
+                import neopixel
+                n = led_cfg.get("count", NUM_POTS)
+                self._leds = neopixel.NeoPixel(
+                    self.slot.pin(led_cfg.get("pin", "E"), machine.Pin.OUT), n)
+            except Exception as e:
+                self._leds = None
+                print("cynthia: pot-board LEDs unavailable:", e)
 
     def stop(self):
+        # Release the SPI host too: machine.SPI(id) cannot be created twice, so
+        # a stop()/start() pair (instrument switch, driver reload) would fail
+        # with "SPI host already in use" if the peripheral stayed claimed.
+        if self._spi is not None:
+            try:
+                self._spi.deinit()
+            except Exception:
+                pass
+            self._spi = None
         self.slot.release()
 
     # --- MCP3002 ---
@@ -170,17 +188,23 @@ class Driver:
             return ang0
         if not w0_rails and not w1_rails:
             # Neither near the rails: use the wiper farther from its deadzone.
-            dist0 = (340.0 - ang0) if ang0 < 340.0 else 0.0
-            if 160.0 <= ang1 <= 180.0:
-                dist1 = 0.0
-            else:
-                d160 = ang1 - 160.0
-                if d160 < 0:
-                    d160 = -d160
-                d180 = ang1 - 180.0
-                if d180 < 0:
-                    d180 = -d180
-                dist1 = d160 if d160 < d180 else d180
+            #
+            # Wiper 0's dead zones are at BOTH ends of its 340 deg travel
+            # (raw near 0 and near 1023), so its distance is the nearer of the
+            # two. Only measuring from the 340 end made a wiper sitting just
+            # off raw=0 look maximally safe and picked its noisy value.
+            dist0 = ang0
+            if 340.0 - ang0 < dist0:
+                dist0 = 340.0 - ang0
+            # Wiper 1 is offset by 180 deg, so its dead zones land at 160 and
+            # 180 after normalisation.
+            d160 = ang1 - 160.0
+            if d160 < 0:
+                d160 = -d160
+            d180 = ang1 - 180.0
+            if d180 < 0:
+                d180 = -d180
+            dist1 = d160 if d160 < d180 else d180
             return ang0 if dist0 > dist1 else ang1
         return ang0  # both near rails (shouldn't happen); fall back
 
@@ -218,7 +242,7 @@ class Driver:
         if now_ms is None:
             import time
             now_ms = time.ticks_ms()
-        last = getattr(self, "_last_scan_ms", None)
+        last = self._last_scan_ms
         if last is not None and _ticks_diff(now_ms, last) < SCAN_PERIOD_MS:
             return
         self._last_scan_ms = now_ms
@@ -233,11 +257,25 @@ class Driver:
 
     def _update_leds_auto(self):
         # LED i tracks pot i: map position to hue across a pleasant range
-        # (0.0 warm/red -> 1.0 cool/blue), constant brightness.
+        # (0.0 warm/red -> 1.0 cool/blue), constant brightness. Only rewrite
+        # when a pot moved past the threshold; see _led_shown above.
+        changed = False
         for i in range(len(self._leds)):
             v = self.values[i] if i < NUM_POTS else 0.0
-            self._leds[i] = _hue_to_rgb(0.0 + v * 0.66)
-        self._leds.write()
+            shown = self._led_shown[i] if i < NUM_POTS else None
+            if shown is not None:
+                d = v - shown
+                if d < 0:
+                    d = -d
+                if d < LED_EPSILON:
+                    continue
+            rgb = _hue_to_rgb(v * 0.66)
+            self._leds[i] = rgb
+            if i < NUM_POTS:
+                self._led_shown[i] = v
+            changed = True
+        if changed:
+            self._leds.write()
 
     def set_led_mode(self, mode):
         """'auto' (track pots) or 'manual' (explicit set_leds)."""
