@@ -72,6 +72,25 @@ DELTA_DEADBAND_DEG = 2.0
 GLITCH_DEG = 90.0
 
 
+def _median3(a, b, c):
+    """Median of three, tolerating missing history (None -> return c).
+
+    A single corrupted ADC read is the dominant failure on this board (a stale
+    wiper count, or both channels railed for one scan). The median of the last
+    three samples discards it without adding latency to real movement: a ramp
+    passes through unchanged, a one-sample spike disappears.
+    """
+    if a is None or b is None:
+        return c
+    if a > b:
+        a, b = b, a
+    if b > c:
+        b = c
+    if a > b:
+        b = a
+    return b
+
+
 def _ticks_diff(a, b):
     """Wrap-safe tick difference."""
     return time.ticks_diff(a, b)
@@ -103,6 +122,11 @@ class Driver:
         self.values = [0.0] * NUM_POTS
         # Rotation accumulation for relative mode (see DELTA_DEADBAND_DEG).
         self._anchor = [None] * NUM_POTS   # last angle a delta was emitted at
+        # Last two raw samples per wiper, for the median filter.
+        self._r0p1 = [None] * NUM_POTS
+        self._r0p2 = [None] * NUM_POTS
+        self._r1p1 = [None] * NUM_POTS
+        self._r1p2 = [None] * NUM_POTS
         self._delta = [0.0] * NUM_POTS     # pending turns since last read
         self._has_delta = False
         self._glitches = 0
@@ -130,7 +154,18 @@ class Driver:
         self._clk.value(0)
         self._rst.value(0)
         self._cs.value(1)
-        self._spi = self.slot.spi(sck="D", mosi="B", miso="C", baudrate=1000000)
+        # Timing knobs, overridable per board in daughterboard.json: if the
+        # panel is glitchy, try a slower SPI clock (signal integrity over the
+        # FFC) or a longer mux settle (analog settling) before changing hardware.
+        try:
+            self._mux_settle_us = int(self.cfg.get("mux_settle_us", MUX_SETTLE_US))
+        except (TypeError, ValueError):
+            self._mux_settle_us = MUX_SETTLE_US
+        try:
+            self._spi_baud = int(self.cfg.get("spi_baudrate", 1000000))
+        except (TypeError, ValueError):
+            self._spi_baud = 1000000
+        self._spi = self.slot.spi(sck="D", mosi="B", miso="C", baudrate=self._spi_baud)
         self._reset_counter()
         time.sleep_ms(10)  # supply ramp for muxes/ADC (from the prototype)
         led_cfg = self.cfg.get("leds")
@@ -189,14 +224,14 @@ class Driver:
         self._rst.value(1)
         time.sleep_us(10)
         self._rst.value(0)
-        time.sleep_us(MUX_SETTLE_US)
+        time.sleep_us(self._mux_settle_us)
 
     def _pulse_counter(self):
         # 74HC393 counts on the falling edge of CLK.
         self._clk.value(1)
         time.sleep_us(10)
         self._clk.value(0)
-        time.sleep_us(MUX_SETTLE_US)
+        time.sleep_us(self._mux_settle_us)
 
     # --- angle math (ported from computeAngle) ---
 
@@ -259,7 +294,15 @@ class Driver:
             if addr < NUM_POTS - 1:
                 self._pulse_counter()
         for i in range(NUM_POTS):
-            ang = self._compute_angle(self._phase0[i], self._phase1[i])
+            r0 = self._phase0[i]
+            r1 = self._phase1[i]
+            m0 = _median3(self._r0p2[i], self._r0p1[i], r0)
+            m1 = _median3(self._r1p2[i], self._r1p1[i], r1)
+            self._r0p2[i] = self._r0p1[i]
+            self._r0p1[i] = r0
+            self._r1p2[i] = self._r1p1[i]
+            self._r1p1[i] = r1
+            ang = self._compute_angle(m0, m1)
             self.values[i] = ang / 360.0
             # Relative mode: accumulate wrap-aware rotation in degrees, emitted
             # in DELTA_DEADBAND_DEG steps from an anchor that only moves when a
@@ -321,6 +364,10 @@ class Driver:
             out.append((i, self._phase0[i], self._phase1[i],
                         round(self.values[i] * 360.0, 1)))
         return out
+
+    def timing(self):
+        """(spi_baudrate, mux_settle_us) currently in use."""
+        return (self._spi_baud, self._mux_settle_us)
 
     def set_delta_deadband(self, deg):
         """Change the rotation hysteresis at runtime (diagnostic aid)."""

@@ -132,6 +132,11 @@ def pots_report():
         print("P%02d %5d %5d %8.1f   %s" % (i + 1, r0, r1, ang, on))
     if hasattr(drv, "delta_deadband"):
         print("deadband: %.1f deg" % drv.delta_deadband())
+    if hasattr(drv, "timing"):
+        baud, settle = drv.timing()
+        print("spi: %d Hz   mux settle: %d us" % (baud, settle))
+    if hasattr(drv, "glitch_count"):
+        print("glitches: %d" % drv.glitch_count())
 
 
 def set_pot_deadband(deg):

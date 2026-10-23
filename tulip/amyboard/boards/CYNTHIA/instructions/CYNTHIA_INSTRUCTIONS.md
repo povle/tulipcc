@@ -451,6 +451,14 @@ Driver notes worth keeping:
   columns wandering → sensing (mux/wiring/noise). A glitch count that climbs
   with nobody touching the panel is the signature of the two wipers being
   reconciled ~180 degrees apart, i.e. wrong pairing rather than noise.
+  **Isolated bad reads are the dominant failure mode** on the sample board: a
+  trace showed the two wipers agreeing within 0.1-5 degrees almost every sample,
+  with occasional single samples where one wiper was stale (raw1 ~500 when it
+  should be ~57) or both railed. Each wiper is therefore median-filtered over the
+  last three scans before the angle is computed; a one-sample corruption then
+  cannot reach the angle, and real movement passes through unchanged. Timing is
+  tunable per board in `daughterboard.json` (`spi_baudrate`, `mux_settle_us`) if
+  a panel turns out to be noisier than that.
   `GLITCH_DEG` (90) rejects movement no hand can produce (25 turns/s at 50Hz),
   so a broken board degrades to "knob does nothing" instead of slamming values.
 - The LED strip is optional and best-effort: a missing `neopixel` module or an
