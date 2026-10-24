@@ -473,7 +473,8 @@ Driver notes worth keeping:
   conversions 20us apart. Near zero means the node is settled and the ADC/pot
   are quiet; tens of counts means it is still settling (charge injection from
   the mux address change) or noisy. The patch buttons cycle the mux settle time
-  (0/50/100/200/500/1000us) live and toast the new value; `rt.set_pot_settle(us)`
+  (0/50/100/200/500/1000us) live, and the current value is on the `exp` line
+  (`exp 58 settle 100us`); `rt.set_pot_settle(us)`
   does the same from the REPL. This is how to tell "not enough settling" from
   "a bad channel": if raising the settle collapses `d0/d1` and the drift, it was
   settling; if it does not, suspect a floating/high-impedance channel elsewhere

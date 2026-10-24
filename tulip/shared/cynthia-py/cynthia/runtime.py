@@ -1967,8 +1967,11 @@ def _draw_pot_debug(disp):
     elif err < -511.5:
         err += 1083.0
     sd0, sd1 = drv.settle_delta(_pot_dbg_sel) if hasattr(drv, "settle_delta") else (0, 0)
+    settle = drv.mux_settle() if hasattr(drv, "mux_settle") else 0
     lines = [
-        "exp %4d" % exp,
+        # Settle time lives here: the title row is already carrying the scan
+        # mode, and this line had room.
+        "exp %4d settle %dus" % (exp, settle),
         # d0/d1: how far the reading moved between two conversions 20us apart.
         # Near zero means the node is settled; tens of counts means it is not.
         "raw %4d/%4d d%+d/%+d" % (r0, r1, sd0, sd1),
