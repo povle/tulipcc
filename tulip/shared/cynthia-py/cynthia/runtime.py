@@ -1066,12 +1066,63 @@ def _poll(tick):
         return
 
 
+def _prof_add(name, t0):
+    e = _prof.get(name)
+    d = time.ticks_diff(time.ticks_us(), t0)
+    if e is None:
+        _prof[name] = [d, 1]
+    else:
+        e[0] += d
+        e[1] += 1
+
+
+def poll_profile(on=None):
+    """REPL: where one UI poll spends its time, and how often it paints.
+
+    rt.poll_profile(True) to start, use the UI for a few seconds, then
+    rt.poll_profile() to print and reset. Reports the poll rate, the paint rate
+    (that is the screen's actual FPS) and the average cost of the input scan
+    versus the draw+flush. The two numbers that matter for raising the FPS are
+    the paint rate and "draw+paint": a full 128x64 SH1106 push is 1024 bytes,
+    ~23ms of I2C at 400kHz, so if draw+paint dominates that is the target.
+    """
+    global _PROFILE, _prof
+    if on is not None:
+        _PROFILE = bool(on)
+        _prof = {}
+        print("cynthia: poll profiling %s" % ("on" if _PROFILE else "off"))
+        if _PROFILE:
+            print("cynthia: use the UI for a few seconds, then call"
+                  " rt.poll_profile() with no argument")
+        return _PROFILE
+    if not _prof:
+        print("cynthia: no samples - run rt.poll_profile(True) first")
+        return None
+    tot_us, tot_n = _prof.get("total", [1, 1])
+    secs = tot_us / 1000000.0
+    rate = tot_n / secs if secs else 0.0
+    print("cynthia: %d polls in %.1fs = %.1f Hz, %.2f ms each"
+          % (tot_n, secs, rate, tot_us / tot_n / 1000.0))
+    for k in ("input", "draw+paint", "total"):
+        e = _prof.get(k)
+        if e:
+            print("  %-11s %7.2f ms avg  %4d times  %6.1f/s"
+                  % (k, e[0] / e[1] / 1000.0, e[1], e[1] / secs if secs else 0.0))
+    out = {k: v[0] / v[1] for k, v in _prof.items()}
+    _prof = {}
+    return out
+
+
 def _poll_body(tick):
     """The actual poll work, split out so _poll can guard it as a unit."""
     global _tick, _stable_after, _last_knob_ch, _last_knob_time, _dirty
     global _last_knob_src
+    t_body = time.ticks_us() if _PROFILE else 0
     now = time.ticks_ms()
+    t0 = time.ticks_us() if _PROFILE else 0
     surface.poll(now)
+    if _PROFILE:
+        _prof_add("input", t0)
 
     # Route pot movement to the engine (§9.2 -> instrument params).
     if _engine is not None and hasattr(_engine, "update_pot"):
@@ -1201,7 +1252,21 @@ def _poll_body(tick):
 
     _tick += 1
     if _dirty or (_REFRESH_MS and time.ticks_diff(now, _last_paint_ms) >= _REFRESH_MS):
-        _draw_ui()
+        if _PROFILE:
+            t0 = time.ticks_us()
+            _draw_ui()
+            _prof_add("draw+paint", t0)
+        else:
+            _draw_ui()
+    if _PROFILE:
+        _prof_add("total", t_body)
+
+# In-situ poll profiling (off unless rt.poll_profile(True)). Timed INSIDE the
+# real polls as they run: calling _poll() from the REPL measures it interleaved
+# with the sequencer's own scheduled polls, which is what made an earlier
+# measurement of this look 200x off.
+_PROFILE = False
+_prof = {}              # phase -> [total_us, count]
 
 _last_joy = None
 _last_knob_ch = -1      # mapped engine channel of the last knob that moved

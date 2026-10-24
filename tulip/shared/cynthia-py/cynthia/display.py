@@ -63,6 +63,9 @@ class SH1106:
         if i2c is None:
             i2c = I2C(0, scl=Pin(pins.I2C_SCL), sda=Pin(pins.I2C_SDA), freq=400000)
         self.i2c = i2c
+        # Shadow of what the panel is actually showing, so show() can skip pages
+        # that did not change. None until the first frame.
+        self._shadow = None
 
         # Framebuffer: MONO_VLSB is the native SH1106 format
         self.buffer = bytearray(WIDTH * HEIGHT // 8)
@@ -98,18 +101,47 @@ class SH1106:
         self._write_cmd(0xA6)  # Normal display (not inverted)
         self._write_cmd(0xAF)  # Display on
 
-    def show(self):
-        """Push the framebuffer to the display."""
-        # SH1106 requires page-by-page writes with column offset
-        for page in range(8):  # 64 rows / 8 = 8 pages
+    def show(self, force=False):
+        """Push the framebuffer to the display, page by page.
+
+        A full 128x64 frame is 1024 bytes, which is ~23ms of I2C wire time at
+        400kHz - that alone caps the screen near 40fps however fast the UI is.
+        Almost every frame differs in only a few pages (a knob value, one
+        slider), so this keeps a shadow copy of what the panel is showing and
+        sends only the pages that actually changed. Each page goes out with
+        writevto so no 129-byte buffer is allocated per page (that copy was 8
+        allocations per frame).
+
+        force=True repaints everything (use after anything that could have
+        left the panel's RAM out of step, e.g. a reset).
+        """
+        buf = self.buffer
+        sh = self._shadow
+        if force or sh is None:
+            pages = range(8)                     # first frame: send everything
+        else:
+            pages = [p for p in range(8)
+                     if buf[p * WIDTH:(p + 1) * WIDTH] != sh[p * WIDTH:(p + 1) * WIDTH]]
+            if not pages:
+                return
+        for page in pages:
             self._write_cmd(
                 0xB0 | page,  # Set page address
                 0x00 | (_COL_OFFSET & 0x0F),  # Lower column address
                 0x10 | ((_COL_OFFSET >> 4) & 0x0F),  # Upper column address
             )
-            # Send 128 bytes of data for this page
-            offset = page * WIDTH
-            self.i2c.writeto(self.addr, bytes([_DATA]) + self.buffer[offset:offset + WIDTH])
+            o = page * WIDTH
+            try:
+                self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[o:o + WIDTH]))
+            except (AttributeError, TypeError):
+                # writevto is not everywhere (e.g. some ports); keep the copy.
+                self.i2c.writeto(self.addr, bytes([_DATA]) + buf[o:o + WIDTH])
+        if sh is None:
+            self._shadow = bytearray(buf)
+        else:
+            for page in pages:
+                o = page * WIDTH
+                sh[o:o + WIDTH] = buf[o:o + WIDTH]
 
     # --- framebuf passthrough methods ---
 
