@@ -508,6 +508,35 @@ class Driver:
         """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
         return self.values
 
+    def set_spi_baud(self, baud):
+        """Change the SPI clock live.
+
+        The MCP3002 samples for 1.5 clock periods, so the clock rate IS the
+        sample window: 1.5us at 1MHz, 3.75us at 400kHz, 15us at 100kHz. If a
+        wiper's source impedance is high, the sample capacitor cannot charge
+        from the newly selected channel in time and the reading is pulled toward
+        whatever the mux was showing before - which is exactly a disturbance
+        introduced by moving the mux rather than by the pot itself.
+        """
+        baud = int(baud)
+        if baud < 10000:
+            baud = 10000
+        self._spi_baud = baud
+        if self._spi is not None:
+            try:
+                self._spi.init(baudrate=baud)
+            except Exception:
+                try:
+                    self._spi.deinit()
+                except Exception:
+                    pass
+                self._spi = self.slot.spi(sck="D", mosi="B", miso="C",
+                                          baudrate=baud)
+        return baud
+
+    def spi_baud(self):
+        return self._spi_baud
+
     def settle_delta(self, pot):
         """(d0, d1) = |real - dummy| of the last conversion of each wiper."""
         return (self._sd0[pot], self._sd1[pot])

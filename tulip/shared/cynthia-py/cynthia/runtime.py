@@ -137,6 +137,9 @@ def pots_report():
     if hasattr(drv, "timing"):
         baud, settle = drv.timing()
         print("spi: %d Hz   mux settle: %d us" % (baud, settle))
+    if hasattr(drv, "spi_baud"):
+        print("spi baud: %d Hz (sample window %.2f us)"
+              % (drv.spi_baud(), 1500000.0 / drv.spi_baud()))
     if hasattr(drv, "single_pot"):
         sp = drv.single_pot()
         print("mode: %s" % ("single pot P%02d" % (sp + 1) if sp is not None else "all addresses"))
@@ -1353,10 +1356,9 @@ def _handle_event(ev):
                 _cycle_pot_settle()
                 _draw_ui(force=True)
             elif kind == "short_press":
-                step = -1 if idx == BTN_OCTAVE_DOWN else 1
-                _pot_dbg_sel = max(0, min(15, _pot_dbg_sel + step))
-                if _POT_DBG_RATES[_pot_dbg_rate][0] == "one":
-                    _apply_pot_dbg_rate()
+                # Octave buttons: SPI clock (the sample window). Patch buttons
+                # above own the settle time; the stick owns pot and scan mode.
+                _cycle_pot_baud()
                 _draw_ui(force=True)
             return
         if _local_active:
@@ -1975,7 +1977,8 @@ def _draw_pot_debug(disp):
         # d0/d1: how far the reading moved between two conversions 20us apart.
         # Near zero means the node is settled; tens of counts means it is not.
         "raw %4d/%4d d%+d/%+d" % (r0, r1, sd0, sd1),
-        "pos %6.1f" % ang,
+        "pos %6.1f spi %s" % (ang, _baud_label(drv.spi_baud())
+                              if hasattr(drv, "spi_baud") else "?"),
         "err %+5.0f rej %d" % (err, perr),
     ]
     if _POT_DBG_RATES[_pot_dbg_rate][1] is None:
@@ -2051,6 +2054,38 @@ def set_pot_settle(us):
 def pot_settle():
     drv = _pot_driver()
     return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
+
+
+_POT_BAUDS = (1000000, 500000, 250000, 100000)
+
+
+def _baud_label(b):
+    return ("%dk" % (b // 1000)) if b < 1000000 else "1M"
+
+
+def set_pot_spi_baud(baud):
+    """REPL: SPI clock in Hz (the MCP3002 samples for 1.5 clock periods)."""
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_spi_baud"):
+        print("cynthia: no pot board with a baud control")
+        return None
+    baud = drv.set_spi_baud(baud)
+    print("cynthia: spi baud = %d Hz (sample window %.2fus)"
+          % (baud, 1500000.0 / baud))
+    return baud
+
+
+def _cycle_pot_baud():
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_spi_baud"):
+        return
+    try:
+        i = _POT_BAUDS.index(drv.spi_baud())
+    except (ValueError, AttributeError):
+        i = 0
+    nxt = _POT_BAUDS[(i + 1) % len(_POT_BAUDS)]
+    drv.set_spi_baud(nxt)
+    toast("spi %s (%.1fus)" % (_baud_label(nxt), 1500000.0 / nxt), 900)
 
 
 def _cycle_pot_settle():

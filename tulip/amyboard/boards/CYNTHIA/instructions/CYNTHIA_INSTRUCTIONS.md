@@ -468,6 +468,18 @@ Driver notes worth keeping:
   left frozen. `rt.set_pot_scan_rate(ms|None)` and `rt.pot_scan_rate()` do the
   same from the REPL. Note `rt.trace_pot()` scans directly on top of the poll,
   so its rejection counts climb faster than the steady-state rate.
+  **SPI clock = sample window.** The MCP3002 samples for 1.5 clock periods, so
+  the clock rate is how long its sample capacitor has to charge from the newly
+  selected channel: 1.5us at 1MHz, 3.75us at 400kHz, 15us at 100kHz. The octave
+  buttons cycle it live (toast shows the window in us) and it is displayed on
+  the `pos` line as `spi 1M`/`500k`; `rt.set_pot_spi_baud(hz)` from the REPL. A
+  high source impedance (bad wiper contact, thin FFC trace) means the capacitor
+  cannot reach the new channel's voltage, so the reading is pulled toward
+  whatever the mux showed before - a disturbance introduced by MOVING the mux,
+  which is why `d0/d1` stays at zero while the value jumps, and why single-pot
+  mode (same previous channel every time) is steady. A floating input is the
+  extreme case: the capacitor can never charge at all, so that channel simply
+  reports the previous one.
   **Settling readout.** The dummy conversion that used to be discarded is now
   kept, and the scope prints `d0/d1` = how far the reading moved between two
   conversions 20us apart. Near zero means the node is settled and the ADC/pot
