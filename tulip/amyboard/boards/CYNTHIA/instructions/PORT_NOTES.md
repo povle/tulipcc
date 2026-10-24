@@ -485,3 +485,51 @@ A *deterministic* miscount at the same edge every sweep cannot be distinguished
 from a real reading by any comparison - it would show as a permanent
 mis-mapping, not intermittent jumps. Intermittent = detectable, which is what
 `_verify_upper` targets.
+
+## Two scanners on one bus: the C input task was still driving the pot pins
+
+The whole class of "the pot values jump / slide to a neighbour / the readings
+make no sense" bugs traced back to this, and it is worth reading before touching
+the pot driver again.
+
+`cynthia_input.c` carries a **direct-address pot scanner** from the OLD board:
+it configures `DB2_A..DB2_D` as plain GPIO outputs, bit-bangs a 4-bit mux
+address on them (`set_mux_channel`), and reads the wiper through the **ADS1115**
+on `ADC_A_2` — one conversion plus a 2 ms wait per pot, forever, in the input
+task.
+
+On the CURRENT pot board those same four GPIOs are not address lines:
+
+| pin | GPIO | old board | current board |
+| --- | ---- | --------- | ------------- |
+| DB2_A | 48 | address bit 0 | **74HC393 ADDR_CLK** |
+| DB2_B | 47 | address bit 1 | **MCP3002 MOSI** |
+| DB2_C | 21 | address bit 2 | **MCP3002 MISO** |
+| DB2_D | 11 | address bit 3 | **MCP3002 SCK** |
+
+So the C task was clocking the counter behind the driver's back and playing with
+the SPI bus at the same time. Consequences, all of which looked like driver
+faults:
+
+- **Extra counter edges** -> the address slides by one -> a pot shows its
+  neighbour's value (and because a full sweep re-reads everything, it looks
+  intermittent).
+- **The two channel reads of one address can land on different addresses** (the
+  C task rewrites the lines every ~1-2 ms) -> the wiper pair disagrees by
+  140-175 deg -> the pair check rejects it. A pot rejected on *every* sweep is
+  not necessarily a broken pot.
+- **MISO driven as an output mid-transfer** -> corrupt conversions.
+- **The deliberately-shifted self-test controls could not trip**, because our
+  extra pulse is irrelevant next to another task continuously writing the same
+  lines.
+
+Fix: `s_pot_scan_enabled`, default **false**, gates the mux `gpio_config`, the
+boot prescan and the per-iteration scan in `cynthia_input.c`. It is exposed as
+`tulip.cynthia_pot_scan(bool)` and `spark_pots_new.start()` claims the slot with
+`tulip.cynthia_pot_scan(False)` (also in `spark_pots_legacy.py`'s interest - it
+bit-bangs pin A itself). Enabling it (re)claims the four pins as outputs;
+disabling releases them to inputs.
+
+Lesson: **two things driving one pin is not a race you can out-tune.** Before
+trusting any pot measurement, check `tulip.cynthia_pot_scan()` is False and that
+no other scanner is configured for the same slot.

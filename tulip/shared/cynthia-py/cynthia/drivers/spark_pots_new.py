@@ -266,6 +266,19 @@ class Driver:
     # --- lifecycle ---
 
     def start(self):
+        # Claim the slot from the legacy C pot scanner. cynthia_input.c still
+        # carries a direct-address scanner (4 GPIOs bit-banging a mux address +
+        # an ADS conversion) from the old board; on this board those same pins
+        # are ADDR_CLK and the MCP3002 SPI bus, so if it runs we get spurious
+        # counter edges (values slide to a neighbouring pot) and it drives MISO
+        # as an output during our transfers. It defaults to off - this makes the
+        # ownership explicit and also catches it being switched on by hand.
+        try:
+            import tulip
+            if hasattr(tulip, "cynthia_pot_scan"):
+                tulip.cynthia_pot_scan(False)
+        except Exception:
+            pass
         self._clk = self.slot.pin("A", machine.Pin.OUT)
         self._rst = self.slot.pin("G", machine.Pin.OUT)
         self._cs = self.slot.pin("F", machine.Pin.OUT)

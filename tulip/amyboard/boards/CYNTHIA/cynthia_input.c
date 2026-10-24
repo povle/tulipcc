@@ -98,6 +98,17 @@ static const key_pin_t btn_pins[4] = {
 // 32-bit float stores are atomic on ESP32, so no lock is needed — only the
 // compiler must not hoist the read.
 static volatile float s_knob_values[CYNTHIA_NUM_POTS] = {0.5f};
+// Legacy direct-address pot scan (4 GPIOs bit-banging a mux address + ADS1115).
+//
+// OFF by default, and it must stay off whenever a Python pot driver is loaded.
+// On the current pot board those SAME four pins are not address lines at all:
+// DB2_A is the 74HC393 counter CLOCK and DB2_B/C/D are the MCP3002's
+// MOSI/MISO/SCK. Leaving this running meant two scanners fighting over one
+// bus: every address change here is a spurious ADDR_CLK edge (the counter gains
+// steps, so pot values slide onto a neighbour), it drives MISO as an output
+// mid-transfer, and it costs an ADS conversion + 2ms per pot on I2C.
+// `tulip.cynthia_pot_scan(bool)` toggles it at runtime.
+static volatile bool s_pot_scan_enabled = false;
 static bool s_first_pot_read[CYNTHIA_NUM_POTS] = {false};
 static volatile float s_joy_x = 0.5f;   // cross-core (see s_knob_values)
 static volatile float s_joy_y = 0.5f;
@@ -268,7 +279,10 @@ void cynthia_input_init(void) {
     i2c_param_config(I2C_NUM_1, &i2c1_conf);
     i2c_driver_install(I2C_NUM_1, I2C_MODE_MASTER, 0, 0, 0);
 
-    // 1. Configure MUX GPIOs
+    // 1. Configure MUX GPIOs - only if the legacy scan is wanted. Configuring
+    //    them also sets DB2_B/C/D (the MCP3002's SPI pins) as plain OUTPUTs,
+    //    which breaks the Python driver's bus on its own.
+    if (s_pot_scan_enabled) {
     gpio_config_t mux_conf = {
         .pin_bit_mask = (1ULL << DB2_A) | (1ULL << DB2_B) | (1ULL << DB2_C) | (1ULL << DB2_D),
         .mode = GPIO_MODE_OUTPUT,
@@ -277,6 +291,7 @@ void cynthia_input_init(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&mux_conf);
+    }
 
     // 2. Configure Joystick Button GPIO (IO_G_1 = DB1_G = GPIO 10)
     // C++ Hardware.cpp: pinMode(BTN_JOYSTICK, INPUT_PULLDOWN), HIGH = pressed
@@ -332,11 +347,16 @@ void cynthia_input_init(void) {
     // 5. Full initial prescan: read all 16 pots + joystick so real values
     //    are available from the first Python poll, eliminating the ramp
     //    from 0.5→real that would override freshly-loaded patch params.
-    fprintf(stderr, "cynthia_input_init: prescanning pots...\n"); fflush(stderr);
-    for (uint8_t i = 0; i < CYNTHIA_NUM_POTS; i++) {
-        s_first_pot_read[i] = false;
-        read_pot_mux(i);
-        if (i % 4 == 0) vTaskDelay(pdMS_TO_TICKS(2));
+    if (s_pot_scan_enabled) {
+        fprintf(stderr, "cynthia_input_init: prescanning pots...\n"); fflush(stderr);
+        for (uint8_t i = 0; i < CYNTHIA_NUM_POTS; i++) {
+            s_first_pot_read[i] = false;
+            read_pot_mux(i);
+            if (i % 4 == 0) vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    } else {
+        fprintf(stderr, "cynthia_input_init: legacy pot scan disabled"
+                " (the mux pins belong to the slot driver)\n"); fflush(stderr);
     }
     // Joystick is read read_joystick_axes inside the loop.
     s_first_joy_x_read = false;
@@ -545,10 +565,15 @@ void cynthia_input_task(void *pvParameters) {
         // 1. Fast Key & Button Scan (every iteration, ~6ms)
         scan_keys_and_buttons(now_ms);
 
-        // 2. Interleaved Pot Scan (POTS_PER_ITER channels per iteration)
-        for (uint8_t _p = 0; _p < POTS_PER_ITER; _p++) {
-            read_pot_mux(pot_cursor);
-            pot_cursor = (uint8_t)((pot_cursor + 1) % CYNTHIA_NUM_POTS);
+        // 2. Interleaved Pot Scan (POTS_PER_ITER channels per iteration).
+        //    Skipped entirely when disabled: read_pot_mux() writes the mux
+        //    address GPIOs, which on the current board are the counter CLK and
+        //    the MCP3002 SPI bus.
+        if (s_pot_scan_enabled) {
+            for (uint8_t _p = 0; _p < POTS_PER_ITER; _p++) {
+                read_pot_mux(pot_cursor);
+                pot_cursor = (uint8_t)((pot_cursor + 1) % CYNTHIA_NUM_POTS);
+            }
         }
 
         // 3. Joystick scan at ~30Hz
@@ -559,6 +584,29 @@ void cynthia_input_task(void *pvParameters) {
 
         vTaskDelay(pdMS_TO_TICKS(1));
     }
+}
+
+// Turn the legacy direct-address pot scan on/off (see s_pot_scan_enabled).
+// Enabling (re)claims the mux GPIOs as outputs; disabling releases them to
+// inputs so whoever owns the slot can configure them. Returns the new state.
+bool cynthia_pot_scan_enable(bool on) {
+    s_pot_scan_enabled = on;
+    gpio_config_t mux_conf = {
+        .pin_bit_mask = (1ULL << DB2_A) | (1ULL << DB2_B) | (1ULL << DB2_C) | (1ULL << DB2_D),
+        .mode = on ? GPIO_MODE_OUTPUT : GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = on ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&mux_conf);
+    if (!on) {
+        for (int i = 0; i < CYNTHIA_NUM_POTS; i++) s_first_pot_read[i] = false;
+    }
+    return s_pot_scan_enabled;
+}
+
+bool cynthia_pot_scan_enabled(void) {
+    return s_pot_scan_enabled;
 }
 
 // Thread-safe cached getters

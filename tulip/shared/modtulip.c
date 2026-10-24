@@ -762,6 +762,8 @@ extern uint32_t cynthia_midi_tap_dropped(void);
 extern bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind);
 extern int8_t cynthia_get_octave_shift(void);
 extern void cynthia_set_octave_shift(int8_t shift);
+extern bool cynthia_pot_scan_enable(bool on);
+extern bool cynthia_pot_scan_enabled(void);
 extern void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port);
 extern int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str);
 extern int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color);
@@ -791,6 +793,8 @@ static inline uint32_t cynthia_midi_tap_dropped(void) { return 0; }
 static inline bool cynthia_get_button_event(uint8_t *btn_idx, uint8_t *kind) { return false; }
 static inline int8_t cynthia_get_octave_shift(void) { return 0; }
 static inline void cynthia_set_octave_shift(int8_t shift) {}
+static inline bool cynthia_pot_scan_enable(bool on) { (void)on; return false; }
+static inline bool cynthia_pot_scan_enabled(void) { return false; }
 static inline void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port) {
     if (out_loops) *out_loops = 0;
     if (out_ads_reads) *out_ads_reads = 0;
@@ -877,6 +881,17 @@ STATIC mp_obj_t tulip_cynthia_octave_shift(size_t n_args, const mp_obj_t *args) 
     return mp_obj_new_int(cynthia_get_octave_shift());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_octave_shift_obj, 0, 1, tulip_cynthia_octave_shift);
+
+// The legacy C pot scan bit-bangs an address on four GPIOs that, on the current
+// pot board, are the counter CLK and the MCP3002 SPI bus. A slot driver that
+// owns those pins must turn it off; tulip.cynthia_pot_scan(False) does that.
+STATIC mp_obj_t tulip_cynthia_pot_scan(size_t n_args, const mp_obj_t *args) {
+    if (n_args > 0) {
+        cynthia_pot_scan_enable(mp_obj_is_true(args[0]));
+    }
+    return mp_obj_new_bool(cynthia_pot_scan_enabled());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_pot_scan_obj, 0, 1, tulip_cynthia_pot_scan);
 
 STATIC mp_obj_t tulip_cynthia_status(void) {
     uint32_t loops = 0, ads_reads = 0;
@@ -2091,6 +2106,7 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_pending), MP_ROM_PTR(&tulip_i2c_bg_pending_obj) },
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_errors), MP_ROM_PTR(&tulip_i2c_bg_errors_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_knobs), MP_ROM_PTR(&tulip_cynthia_knobs_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_pot_scan), MP_ROM_PTR(&tulip_cynthia_pot_scan_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_joystick), MP_ROM_PTR(&tulip_cynthia_joystick_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_buttons), MP_ROM_PTR(&tulip_cynthia_buttons_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_button_event), MP_ROM_PTR(&tulip_cynthia_button_event_obj) },
