@@ -2056,6 +2056,30 @@ def pot_settle():
     return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
 
 
+def pot_timing():
+    """REPL: the live pot timing knobs and what one sweep costs at them.
+
+    The settle and the SPI clock are tunable at runtime, and both are applied
+    to the hardware immediately - so a value left over from a scope session is
+    easy to forget and changes how long everything takes.
+    """
+    drv = _pot_driver()
+    if drv is None:
+        print("cynthia: no pot driver loaded")
+        return None
+    settle = drv.mux_settle() if hasattr(drv, "mux_settle") else None
+    baud = drv.spi_baud() if hasattr(drv, "spi_baud") else None
+    per_us = drv.sweep_us() if hasattr(drv, "sweep_us") else None
+    rate = drv.scan_period() if hasattr(drv, "scan_period") else None
+    warn = ""
+    if per_us is not None and rate is not None and per_us / 1000.0 > rate:
+        warn = ("  <-- a sweep costs MORE than the scan period, so the poll can"
+                " never idle: fix settle/spi first")
+    print("cynthia: settle %sus, spi %s Hz, %.1f ms per sweep, scan every %s ms%s"
+          % (settle, baud, (per_us or 0) / 1000.0, rate, warn))
+    return (settle, baud, per_us, rate)
+
+
 def pot_selftest(sweeps=24, stress=40):
     """REPL: diagnose the pot path with nothing but the panel attached.
 
@@ -2083,11 +2107,24 @@ def pot_selftest(sweeps=24, stress=40):
     settle = drv.mux_settle() if hasattr(drv, "mux_settle") else 100
     per_ms = drv.sweep_us() / 1000.0 if hasattr(drv, "sweep_us") else 3.0
     est_ms = per_ms * (sweeps + 8) + (stress * 17 * (settle + 10)) / 1000.0
+    budget_ms = getattr(drv, "SELFTEST_BUDGET_MS", 2000)
     print("cynthia: pot self-test — %.1f ms/sweep (settle %dus, spi %d Hz), so"
-          " about %.2f s. Leave the knobs alone."
-          % (per_ms, settle, drv.spi_baud(), est_ms / 1000.0))
-    r = drv.selftest(sweeps=sweeps, stress=stress,
-                     progress=lambda m: print("cynthia:   .. %s" % m))
+          " about %.2f s, capped at %.1f s. Leave the knobs alone. Ctrl-C stops"
+          " it." % (per_ms, settle, drv.spi_baud(), est_ms / 1000.0,
+                    budget_ms / 1000.0))
+
+    def _say(msg):
+        print("cynthia:   .. %s" % msg)
+
+    r = drv.selftest(sweeps=sweeps, stress=stress, progress=_say)
+    if r.get("error"):
+        print("cynthia: self-test REFUSED to run: %s" % r["error"])
+        return r
+    run_s, want_s, run_t, want_t = r.get("scaled", (0, 0, 0, 0))
+    if (run_s, run_t) != (want_s, want_t):
+        print("cynthia: scaled down to %d/%d sweeps and %d/%d stress rounds to"
+              " stay inside the %d ms budget"
+              % (run_s, want_s, run_t, want_t, r.get("budget_ms", 0)))
     baud, settle, verify, tol = r["scan"]
     print("cynthia: report — %d sweeps, stress %d, spi %d Hz, settle %dus,"
           " verify %s (tol %d counts)"

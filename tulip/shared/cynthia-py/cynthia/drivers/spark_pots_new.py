@@ -87,6 +87,15 @@ PAIR_TOL_DEG = 20.0
 SHIFT_BAD_PAIRS = 3
 SCAN_RETRIES = 3
 
+# Hard cap on how long the on-device self-test may block. One raw sweep is ~3ms
+# at the default 100us mux settle, but mux_settle and spi_baud are both tunable
+# at runtime and the settle dominates: at 1000us settle + 100kHz SPI a sweep is
+# ~22ms, and a hand-set settle of tens of ms turns the whole test into minutes
+# of silence that looks exactly like a hang. The test therefore scales its own
+# work down to fit, and refuses outright if even the minimum cannot fit.
+SELFTEST_BUDGET_MS = 2000
+SELFTEST_MIN_SWEEPS = 4
+
 # The pair check cannot see a slip in the SECOND half of the sweep: for
 # addresses 8..15 both muxes select the same sensor (see MUX0_MAP/MUX1_MAP), so
 # a one-step shift still yields a perfectly consistent pair - it is just filed
@@ -824,7 +833,8 @@ class Driver:
             self._delta[i] = 0.0
         self._has_delta = False
 
-    def selftest(self, sweeps=24, stress=40, tol=6.0, progress=None):
+    def selftest(self, sweeps=24, stress=40, tol=6.0,
+                 budget_ms=SELFTEST_BUDGET_MS, progress=None):
         """Diagnose the pot path on-device and return a report dict.
 
         `progress(msg)` is called at every phase boundary. This blocks for
@@ -852,6 +862,33 @@ class Driver:
         out = {}
         out["scan"] = (self._spi_baud, self._mux_settle_us, self._verify,
                        self._verify_tol)
+
+        # Fit the requested work into the budget BEFORE doing any of it.
+        per_sweep_us = self.sweep_us()
+        per_stress_us = 17 * (self._mux_settle_us + 10)
+        # Fit to 80% of the budget: sweep_us() models a raw sweep and does not
+        # include the verification re-read that scan() also performs, so it
+        # reads ~15% low (measured against a sleep/bit-time model of the whole
+        # run).
+        room = int(budget_ms * 8 // 10) * 1000 - 8 * per_sweep_us
+        want_sweeps = int(sweeps)
+        want_stress = int(stress)
+        run_sweeps = min(want_sweeps, max(0, room // per_sweep_us))
+        room -= run_sweeps * per_sweep_us
+        run_stress = min(want_stress, max(0, room // per_stress_us))
+        out["budget_ms"] = int(budget_ms)
+        out["scaled"] = (run_sweeps, want_sweeps, run_stress, want_stress)
+        out["sweep_us"] = per_sweep_us
+        if run_sweeps < SELFTEST_MIN_SWEEPS:
+            out["error"] = (
+                "one sweep costs %d us at settle %d us / spi %d Hz, so even %d"
+                " sweeps blow the %d ms budget. Fix the timing knobs first"
+                " (rt.pot_settle() / rt.set_pot_spi_baud()); at this cost a scan"
+                " cannot keep up with its own pacing either."
+                % (per_sweep_us, self._mux_settle_us, self._spi_baud,
+                   SELFTEST_MIN_SWEEPS, int(budget_ms)))
+            return out
+
         say("checking values[] against the raws it came from")
         # Inspect the LIVE state first: a scan recomputes values[] from the
         # raws, which would erase exactly the divergence we are looking for.
@@ -872,11 +909,11 @@ class Driver:
                                               tol)
 
         say("census: %d untouched sweeps, %d ms each" % (
-            int(sweeps), self.sweep_us() // 1000))
+            run_sweeps, per_sweep_us // 1000))
         clean = 0
         classes = {}
         examples = []
-        for _ in range(int(sweeps)):
+        for _ in range(run_sweeps):
             got = self._capture()
             c = self._classify(ref, got, tol)
             if c["same"] == NUM_POTS:
@@ -888,7 +925,7 @@ class Driver:
                     c["pots"] = [None if a is None else round(a, 1)
                                  for a in got]
                     examples.append(c)
-        out["sweeps"] = int(sweeps)
+        out["sweeps"] = run_sweeps
         out["clean"] = clean
         out["classes"] = classes       # "prev/next/other" -> how many sweeps
         out["examples"] = examples
@@ -898,12 +935,12 @@ class Driver:
         # version of a counter that took an extra edge.
         out["ctrl_plus1"] = self._classify(ref, self._capture(extra=1), tol)
 
-        say("stress: %d rounds of reset+16 pulses" % int(stress))
-        for _ in range(int(stress)):
+        say("stress: %d rounds of reset+16 pulses" % run_stress)
+        for _ in range(run_stress):
             self._reset_counter()
             for _ in range(NUM_POTS):
                 self._pulse_counter()
-        out["stress"] = int(stress)
+        out["stress"] = run_stress
         out["stress_after"] = self._classify(ref, self._capture(), tol)
 
         out["retries"] = self._scan_retries
