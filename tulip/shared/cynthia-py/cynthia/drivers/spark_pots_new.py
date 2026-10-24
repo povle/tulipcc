@@ -138,10 +138,21 @@ VERIFY_BAD_MAX = 1
 MUX_SETTLE_US = 100
 ADC_SETTLE_US = 20
 
-# Minimum gap between full scans. One scan blocks ~3.8ms in SPI settles; the UI
-# poll's budget is ~10ms, so scanning every poll burned ~37% of it. 20ms (50Hz)
-# is far faster than a hand can turn a pot and leaves the poll responsive.
-SCAN_PERIOD_MS = 20
+# Minimum gap between full scans, MEASURED rather than assumed.
+#
+# The whole CYNTHIA UI - input, display AND this scan - runs as one Python
+# sequencer callback in the one MicroPython task (cynthia/runtime.py:903), so
+# the budget is shared and every millisecond here is taken from the UI. Measured
+# with the poll stopped: a sweep is 11.8ms (16 x (2 x 273us ADC reads + 146us
+# counter pulse)). At the old 20ms period that was 59% of the task, against the
+# UI poll's own 14.8ms per frame - ~103% together, i.e. saturated, which is why
+# the panel felt sluggish and why anything added here (the read-repair logic)
+# made it worse.
+#
+# 33ms (30Hz) is still far faster than a hand can turn a pot and drops this to
+# ~36%. Runtime-tunable via rt.set_pot_scan_rate() for anyone who wants the
+# pot scope to refresh faster.
+SCAN_PERIOD_MS = 33
 # Pot movement that justifies rewriting the LED strip (see _update_leds_auto).
 LED_EPSILON = 0.004
 

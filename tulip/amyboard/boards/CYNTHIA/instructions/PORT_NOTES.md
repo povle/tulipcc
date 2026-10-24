@@ -533,3 +533,55 @@ disabling releases them to inputs.
 Lesson: **two things driving one pin is not a race you can out-tune.** Before
 trusting any pot measurement, check `tulip.cynthia_pot_scan()` is False and that
 no other scanner is configured for the same slot.
+
+## Everything "taking 1000x too long": the UI poll shares the Python task
+
+If a Python measurement on CYNTHIA comes back absurdly slow - a 2.7 s pot
+sweep, 29 ms for `time.sleep_us(10)`, 12 ms per Python statement - do **not**
+believe it until the UI poll is stopped. Nothing is broken; the measurement is
+being taken inside a saturated task.
+
+The whole UI - input scan, display AND the pot driver's scan - runs as ONE
+Python sequencer callback in the ONE MicroPython task
+(`cynthia/runtime.py:903`, `sequencer.TulipSequence(4 * PPQ, _poll)` at ~30 Hz).
+`py/vm.c:1344` calls `mp_handle_pending()` at every VM branch, so a pending poll
+runs between two of your statements. Measured budget:
+
+| consumer | cost | share |
+| -------- | ---- | ----- |
+| UI poll, one frame (pots paused) | 14.8 ms | ~44% |
+| pot scan, one sweep | 11.8 ms | ~59% at a 20 ms period |
+| | | **~103% -> saturated** |
+
+When the task oversubscribes, the poll is rescheduled from a full scheduler
+queue and runs back to back; anything else in that task is then interleaved to
+death. That is why adding Python work to the pot driver made the *UI* feel
+sluggish.
+
+How to measure honestly - pause the poll first:
+
+```python
+rt._STOP_POLL = True          # UI off, display frozen; WDT has 60s so this is safe
+r = rt.pot_bench()            # real primitive costs
+rt._STOP_POLL = False
+```
+
+Clean numbers, for reference (settle 100 us, SPI 1 MHz):
+
+| primitive | poll stopped | poll running (useless) |
+| --------- | ------------ | ---------------------- |
+| `sleep_us(10)` | 26.7 us (10 + ~17 overhead) | 29 202 us |
+| `sleep_us(100)` | 114 us | 26 359 us |
+| `_read_adc` | 273 us | 63 231 us |
+| `_pulse_counter` | 146 us | 26 817 us |
+| raw sweep | 11.8 ms | 2 688 881 us |
+
+So the driver's per-primitive costs match their arguments; the sweep is 16 x
+(2 x 273 us reads + 146 us pulse) and is dominated by **per-operation Python
+overhead (~17 us per operation)**, not by the SPI transfer (~32 us of wire
+time). Any future pot optimisation should reduce the *number of operations* per
+sweep, not the clock rates.
+
+Budget arithmetic from that: the old 20 ms scan period was 59% of the task by
+itself (now 33 ms / ~36%), and the UI poll is the other ~44%. Both together
+have to stay under 100%, so changing either needs the other in mind.
