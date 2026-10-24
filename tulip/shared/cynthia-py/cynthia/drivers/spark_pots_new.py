@@ -61,6 +61,24 @@ DEADZONE_RAW = 100
 # falsely rejected, far below the 140-175 deg disagreement a genuinely
 # mis-paired channel shows.
 PAIR_TOL_DEG = 20.0
+
+# A counter that misses a step shifts every later address in that scan, so the
+# data stored for sensor N actually belongs to a neighbour. Because the two
+# muxes are wired in different orders, one shifted address mis-pairs BOTH of the
+# sensors it touches - so a slipped scan shows up as several inconsistent pairs
+# at once, which is a far louder signal than the single-pair noise the per-pot
+# check deals with. Above this many bad pairs the whole scan is treated as
+# address-corrupt and thrown away rather than allowed to poison the values.
+SHIFT_BAD_PAIRS = 3
+SCAN_RETRIES = 3
+
+# The pair check cannot see a slip in the SECOND half of the sweep: for
+# addresses 8..15 both muxes select the same sensor (see MUX0_MAP/MUX1_MAP), so
+# a one-step shift still yields a perfectly consistent pair - it is just filed
+# under the neighbouring pot, which is exactly the "value jumps to the previous
+# pot" symptom. Those addresses are therefore re-read and compared.
+VERIFY_TOL_RAW = 30
+VERIFY_BAD_MAX = 1
 # Mux/counter settle times (from the prototype).
 MUX_SETTLE_US = 100
 ADC_SETTLE_US = 20
@@ -158,6 +176,13 @@ class Driver:
         self._last_delta = 0
         self._sd0 = [0] * NUM_POTS
         self._sd1 = [0] * NUM_POTS
+        # Count of sweeps thrown away because the counter appeared to slip.
+        self._scan_retries = 0
+        self._v0 = [0] * NUM_POTS      # second-pass raws (reallocated never)
+        self._v1 = [0] * NUM_POTS
+        self._verify = bool(cfg_entry.get("verify_sweeps", True))
+        self._verify_tol = int(cfg_entry.get("verify_tol", VERIFY_TOL_RAW))
+        self._verify_fallbacks = 0
         # Knob values 0..1 (angle / 360), exposed via knobs().
         self.values = [0.0] * NUM_POTS
         # Rotation accumulation for relative mode (see DELTA_DEADBAND_DEG).
@@ -376,7 +401,8 @@ class Driver:
         if self._leds and self._led_mode == "auto":
             self._update_leds_auto()
 
-    def _scan_all(self):
+    def _read_all_raw(self):
+        """One sweep of every address, into _phase0/_phase1. No derived state."""
         self._reset_counter()  # address 0
         for addr in range(NUM_POTS):
             ch1 = self._read_adc(1)
@@ -387,8 +413,86 @@ class Driver:
             self._sd1[MUX1_MAP[addr] - 1] = self._last_delta
             if addr < NUM_POTS - 1:
                 self._pulse_counter()
+
+    def _pair_ok(self, raw0, raw1):
+        """Side-effect-free version of the pair test (see _compute_angle)."""
+        w0 = raw0 < DEADZONE_RAW or raw0 > (1023 - DEADZONE_RAW)
+        w1 = raw1 < DEADZONE_RAW or raw1 > (1023 - DEADZONE_RAW)
+        if w0 and w1:
+            return False          # at a real boundary only ONE wiper is dead
+        if w0 or w1:
+            return True           # the live wiper carries the angle
+        a0 = (raw0 / 1023.0) * WIPER_RANGE_DEG
+        a1 = ((raw1 / 1023.0) * WIPER_RANGE_DEG + 180.0) % 360.0
+        d = a1 - a0
+        if d > 180.0:
+            d -= 360.0
+        elif d < -180.0:
+            d += 360.0
+        return -PAIR_TOL_DEG <= d <= PAIR_TOL_DEG
+
+    def _bad_pair_count(self):
+        n = 0
+        for i in range(NUM_POTS):
+            if not self._pair_ok(self._phase0[i], self._phase1[i]):
+                n += 1
+        return n
+
+    def _verify_upper(self):
+        """Re-read addresses 8..15 and count how many disagree with pass one.
+
+        A slipped counter changes every read after the missed pulse, so two
+        passes over the same addresses cannot agree while a pot is static. This
+        is the only check that can catch a slip in the half where the two muxes
+        happen to select the same sensor.
+        """
+        self._seek(8)
+        for addr in range(8, NUM_POTS):
+            ch1 = self._read_adc(1)
+            ch0 = self._read_adc(0)
+            self._v0[MUX0_MAP[addr] - 1] = ch0
+            self._v1[MUX1_MAP[addr] - 1] = ch1
+            if addr < NUM_POTS - 1:
+                self._pulse_counter()
+        bad = 0
+        for i in range(8, NUM_POTS):
+            d0 = self._phase0[i] - self._v0[i]
+            d1 = self._phase1[i] - self._v1[i]
+            if d0 < 0:
+                d0 = -d0
+            if d1 < 0:
+                d1 = -d1
+            if d0 > self._verify_tol or d1 > self._verify_tol:
+                bad += 1
+            else:
+                # Both passes agree: average them, which also halves the noise.
+                self._phase0[i] = (self._phase0[i] + self._v0[i]) // 2
+                self._phase1[i] = (self._phase1[i] + self._v1[i]) // 2
+        return bad
+
+    def _scan_all(self):
+        # Read, validate the whole sweep, and only then commit it. A missed
+        # counter step shifts the data by one sensor: the pair check catches
+        # that in the first half, and the second half is re-read and compared.
+        for _attempt in range(SCAN_RETRIES):
+            self._read_all_raw()
+            if self._bad_pair_count() > SHIFT_BAD_PAIRS:
+                self._scan_retries += 1
+                continue
+            if self._verify and self._verify_upper() > VERIFY_BAD_MAX:
+                self._scan_retries += 1
+                continue
+            for i in range(NUM_POTS):
+                self._update_pot(i)
+            return True
+        # Every attempt looked address-corrupt. Commit the last sweep anyway
+        # rather than nothing: a board that trips the checks every time would
+        # otherwise freeze all 16 pots, which is a worse failure than a jump the
+        # 3-sample median absorbs. `verify_fallbacks()` counts these.
+        self._verify_fallbacks += 1
         for i in range(NUM_POTS):
             self._update_pot(i)
+        return False
 
     def _scan_one(self, n):
         """Poll a single pot: seek to each of its two addresses and read it.
@@ -536,6 +640,16 @@ class Driver:
 
     def spi_baud(self):
         return self._spi_baud
+
+    def verify_fallbacks(self):
+        """Sweeps committed despite failing verification (noisy board / slips
+        on every attempt). A rising count means the checks are not buying
+        anything here; see also scan_retries()."""
+        return self._verify_fallbacks
+
+    def scan_retries(self):
+        """Sweeps discarded because too many pairs disagreed (address slip)."""
+        return self._scan_retries
 
     def settle_delta(self, pot):
         """(d0, d1) = |real - dummy| of the last conversion of each wiper."""
