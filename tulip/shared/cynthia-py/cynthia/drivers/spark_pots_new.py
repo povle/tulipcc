@@ -1034,7 +1034,9 @@ class Driver:
                 " going somewhere the model does not cover - not the settle or"
                 " the baud (they are already %d us / %d Hz). Run rt.pot_bench():"
                 " it times each primitive separately and will name which one"
-                " (a sleep, the ADC read, or the counter pulse)."
+                " (a sleep, the ADC read, or the counter pulse). If those are"
+                " also huge, the UI poll is sharing this task - pause it with"
+                " rt._STOP_POLL = True first."
                 % (per_sweep_us, self.sweep_us(), self._mux_settle_us,
                    self._spi_baud))
             return out

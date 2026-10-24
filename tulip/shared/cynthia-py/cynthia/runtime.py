@@ -2178,10 +2178,19 @@ def pot_bench(iters=20):
     implied = 16 * (2 * seen.get("adc read", 0) + seen.get("counter pulse", 0))
     print("  -> a sweep costs %.1f ms by measurement, vs %.1f ms modelled"
           % (implied / 1000.0, drv.sweep_us() / 1000.0))
+    # A primitive costing far more than its argument usually means the numbers
+    # are being measured through the UI poll, which shares this one Python task
+    # and can inflate them 200x+. Do not conclude anything about the hardware
+    # until it is paused - that mistake cost a long afternoon.
+    if implied > 4 * drv.sweep_us():
+        print("  !! measured %.0f ms/sweep against a %.1f ms model: the UI poll"
+              " shares this task (~14.8ms/frame at ~30Hz), so these numbers are"
+              " inflated. Re-run with the poll paused:" % (implied / 1000.0,
+                                                            drv.sweep_us() / 1000.0))
+        print("     >>> rt._STOP_POLL = True; r = rt.pot_bench(); rt._STOP_POLL = False")
     for label, us, _n in rows:
         if label.startswith("sleep_us") and us > 5 * float(label[9:-1]):
-            print("  !! %s costs %.0f us - sleeps are being rounded up, which"
-                  " multiplies by 16 per sweep" % (label, us))
+            print("  !! %s costs %.0f us, far above its argument" % (label, us))
     return rows
 
 
