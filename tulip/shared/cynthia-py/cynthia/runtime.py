@@ -2056,6 +2056,83 @@ def pot_settle():
     return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
 
 
+def pot_selftest(sweeps=24, stress=40):
+    """REPL: diagnose the pot path with nothing but the panel attached.
+
+    LEAVE THE KNOBS ALONE while it runs - every comparison is against a
+    reference capture, so a hand on a knob reads as a fault. Prints a report and
+    returns it. Answers three questions in order:
+
+      1. is the wrong value in the driver (values[] vs the raws it came from) or
+         downstream of it?
+      2. do untouched sweeps come back address-clean, and if not, do pots read a
+         NEIGHBOUR's angle (address slip) or match nothing (sensing fault)?
+      3. do the deliberate offset controls still trip the detector - i.e. can
+         this board see a slip at all?
+
+    Blocks for roughly 0.2 s (it is a diagnostic, not part of the poll).
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "selftest"):
+        print("cynthia: no pot driver with a self-test loaded")
+        return None
+    r = drv.selftest(sweeps=sweeps, stress=stress)
+    baud, settle, verify, tol = r["scan"]
+    print("cynthia: pot self-test — %d sweeps, stress %d, spi %d Hz, settle %dus,"
+          " verify %s (tol %d counts)"
+          % (r["sweeps"], r["stress"], baud, settle, verify, tol))
+    print("  pot | raw0 raw1 | angle | rejected pairs")
+    for row in r["pots"]:
+        i, p0, p1, u0, u1, ang, perr = row[0], row[1], row[2], row[3], row[4], row[5], row[6]
+        print("  P%02d | %4d %4d | %5.1f | %d" % (i + 1, p0, p1, ang, perr))
+    if r["mismatched_values"]:
+        print("  values[] disagree with their own raws -> SOFTWARE fault:")
+        for pot, shown, fromraws in r["mismatched_values"]:
+            print("     P%02d shows %.1f deg but its raw pair says %.1f"
+                  % (pot, shown, fromraws))
+    else:
+        print("  values[] match the raws they came from (driver bookkeeping OK)")
+    if r["aliases"]:
+        print("  pots currently at the same angle (compare with what is shown): %s"
+              % ", ".join("P%02d=P%02d" % a for a in r["aliases"]))
+    agree, need = r["reference_agreement"]
+    if agree < need:
+        print("  reference agreement %d/%d — the board did NOT agree with itself"
+              " on %d of %d captures, which is itself slippage evidence. The"
+              " census below is labelled against the majority capture."
+              % (agree, need, need - agree, need))
+    else:
+        print("  reference agreement %d/%d (the board agrees with itself)"
+              % (agree, need))
+    print("  untouched sweeps: %d/%d clean" % (r["clean"], r["sweeps"]))
+    for k, n in r["classes"].items():
+        print("     %d sweep(s) with prev/next/other = %s" % (n, k))
+    for ex in r["examples"]:
+        print("     example: prev=%d next=%d other=%d  %s"
+              % (ex["prev"], ex["next"], ex["other"], ex["pots"]))
+    c1, cp, st = r["ctrl_plus1"], r["ctrl_parked15"], r["stress_after"]
+    print("  controls (a slip MUST trip these): +1 offset prev/next/other ="
+          " %d/%d/%d | parked-15 %d/%d/%d | after stress %d/%d/%d"
+          % (c1["prev"], c1["next"], c1["other"],
+             cp["prev"], cp["next"], cp["other"],
+             st["prev"], st["next"], st["other"]))
+    print("  retries %d, fallbacks %d, pair errors %s"
+          % (r["retries"], r["fallbacks"], r["pair_errors"]))
+    # verdict
+    if r["mismatched_values"]:
+        verdict = "SOFTWARE: values[] and the measurement have diverged"
+    elif c1["same"] == len(r["pots"]):
+        verdict = "INCONCLUSIVE: the +1 control did not trip the classifier"
+    elif r["clean"] == r["sweeps"]:
+        verdict = ("counter path clean while idle - the anomaly is NOT an address"
+                   " slip; look at the sensing/compute path or the consumer")
+    else:
+        verdict = ("sweeps are being corrupted while idle: pots reading a"
+                   " NEIGHBOUR = address slip, 'other' only = sensing fault")
+    print("  verdict: %s" % verdict)
+    return r
+
+
 _POT_BAUDS = (1000000, 500000, 250000, 100000)
 
 

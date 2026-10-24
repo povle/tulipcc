@@ -155,6 +155,14 @@ def _ticks_diff(a, b):
     """Wrap-safe tick difference."""
     return time.ticks_diff(a, b)
 
+
+def _circ_diff(a, b):
+    """Shortest angular distance between two angles in degrees (0..180)."""
+    d = (a - b) % 360.0
+    if d > 180.0:
+        d = 360.0 - d
+    return d
+
 # MUX0_MAP[addr] = sensor number (1-based) routed to MCP3002 CH0 (phase 0)
 # MUX1_MAP[addr] = sensor number (1-based) routed to MCP3002 CH1 (phase 1)
 MUX0_MAP = (8, 7, 6, 5, 4, 3, 2, 1, 16, 15, 14, 13, 12, 11, 10, 9)
@@ -416,7 +424,7 @@ class Driver:
         if self._leds and self._led_mode == "auto":
             self._update_leds_auto()
 
-    def _read_all_raw(self):
+    def _read_all_raw(self, reset=True):
         """One sweep of every address, into _phase0/_phase1. No derived state.
 
         Address contract: reset to 0, then EXACTLY 15 pulses, so the counter
@@ -425,8 +433,12 @@ class Driver:
         entirely on _reset_counter() at the top of the next sweep; nothing in
         the sweep itself returns the counter to 0. A stop()/scan() sequence that
         never re-resets would start the next sweep at 15.
+
+        `reset=False` sweeps from wherever the counter is - used by the
+        self-test to build a deliberate offset, never by the scan path.
         """
-        self._reset_counter()  # address 0
+        if reset:
+            self._reset_counter()  # address 0
         for addr in range(NUM_POTS):
             ch1 = self._read_adc(1)
             ch0 = self._read_adc(0)
@@ -673,6 +685,207 @@ class Driver:
     def scan_retries(self):
         """Sweeps discarded because too many pairs disagreed (address slip)."""
         return self._scan_retries
+
+    # --- on-device self-test -------------------------------------------------
+    #
+    # Everything here allocates and blocks; it is a diagnostic, never part of
+    # the scan path. The point is to answer "where is the wrong value?" with
+    # only the panel attached - no scope, no host.
+
+    def _capture(self, reset=True, extra=0):
+        """One raw sweep as per-pot angles (None where the pair was rejected).
+
+        No median, no anchors, no deltas: safe to call between normal scans.
+        `extra` pulses the counter after the reset, which builds a deliberate
+        whole-sweep offset - the controlled version of a counter slip.
+        """
+        if reset:
+            self._reset_counter()
+        for _ in range(extra):
+            self._pulse_counter()
+        self._read_all_raw(reset=False)
+        out = []
+        for i in range(NUM_POTS):
+            out.append(self._compute_angle(self._phase0[i], self._phase1[i]))
+        return out
+
+    @staticmethod
+    def _classify(ref, got, tol=6.0):
+        """Compare two captures pot by pot.
+
+        `prev`/`next` count pots now reading the neighbouring pot's angle - the
+        fingerprint of an address slip. `other` counts pots whose pair was
+        rejected or that match nothing, which is what a sensing fault
+        (railed/pinned wiper, dead channel) looks like instead.
+        """
+        same = prev = nxt = other = 0
+        for i in range(NUM_POTS):
+            g = got[i]
+            if g is None:
+                other += 1
+                continue
+            r = ref[i]
+            if r is not None and _circ_diff(g, r) <= tol:
+                same += 1
+                continue
+            rp = ref[(i - 1) % NUM_POTS]
+            rn = ref[(i + 1) % NUM_POTS]
+            if rp is not None and _circ_diff(g, rp) <= tol:
+                prev += 1
+            elif rn is not None and _circ_diff(g, rn) <= tol:
+                nxt += 1
+            else:
+                other += 1
+        return {"same": same, "prev": prev, "next": nxt, "other": other}
+
+    def _consistency(self):
+        """Pots whose committed angle does not match the raw pair it came from.
+
+        values[i] is always _compute_angle(m0, m1)/360 with m0/m1 also stored in
+        _used0/_used1, so recomputing from _used0/_used1 must reproduce it. A
+        mismatch means values[] has diverged from the measurement - the wrong
+        number being shown for the right reading - which is a software fault,
+        not a counter or wiring fault. Returns [(pot 1-based, shown, from raws)].
+        """
+        bad = []
+        for i in range(NUM_POTS):
+            got = self._compute_angle(self._used0[i], self._used1[i])
+            if got is None:
+                continue          # never used a pair yet (or held a reject)
+            want = self.values[i] * 360.0
+            if _circ_diff(got, want) > 1.0:
+                bad.append((i + 1, round(want, 1), round(got, 1)))
+        return bad
+
+    @staticmethod
+    def _aliases(cap, tol=6.0):
+        """Pot pairs currently showing the same angle - candidate aliasing."""
+        out = []
+        for i in range(NUM_POTS):
+            a = cap[i]
+            if a is None:
+                continue
+            for j in range(i + 1, NUM_POTS):
+                b = cap[j]
+                if b is not None and _circ_diff(a, b) <= tol:
+                    out.append((i + 1, j + 1))
+        return out
+
+    def _consensus_capture(self, n=5):
+        """The capture the board agrees with itself about.
+
+        One reference is not enough: if the counter slips during the reference
+        sweep, every later comparison comes out inverted (the clean sweeps look
+        like the faulty ones). Take `n` and keep the one matching the most of
+        the others. Returns (capture, agreements, n).
+        """
+        caps = []
+        for _ in range(n):
+            caps.append(self._capture())
+        best = caps[0]
+        best_score = -1
+        for i in range(n):
+            score = 0
+            for j in range(n):
+                if i != j and self._classify(caps[i], caps[j])["same"] == NUM_POTS:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best = caps[i]
+        return best, best_score, n
+
+    def _reseed(self):
+        """Re-seed the filter and the anchor from a clean sweep and drop any
+        pending rotation, so running a diagnostic cannot itself look like a turn.
+        """
+        self._read_all_raw()
+        for i in range(NUM_POTS):
+            self._r0p2[i] = self._r0p1[i] = self._phase0[i]
+            self._r1p2[i] = self._r1p1[i] = self._phase1[i]
+            self._used0[i] = self._phase0[i]
+            self._used1[i] = self._phase1[i]
+            ang = self._compute_angle(self._phase0[i], self._phase1[i])
+            if ang is None:
+                ang = self.values[i] * 360.0
+            self.values[i] = ang / 360.0
+            self._anchor[i] = ang
+            self._stale[i] = False
+            self._delta[i] = 0.0
+        self._has_delta = False
+
+    def selftest(self, sweeps=24, stress=40, tol=6.0):
+        """Diagnose the pot path on-device and return a report dict.
+
+        Leave the panel untouched: every comparison is against a reference
+        capture, so a hand on a knob looks like a fault. Runs, in order:
+
+          1. values[] vs the raws it came from   (software layer)
+          2. `sweeps` untouched sweeps, classified (counter layer)
+          3. deliberate +1 offset and a parked-15 sweep (what a slip LOOKS like
+             on this board - the positive control)
+          4. `stress` sweeps' worth of raw counter traffic, then a re-read
+             (is the counter line happy under load?)
+
+        A clean board gives {"clean": sweeps, "prev": 0, "next": 0, ...} with an
+        empty mismatched_values, while the positive controls still report
+        `prev`/`next` - that is the test proving itself.
+        """
+        out = {}
+        out["scan"] = (self._spi_baud, self._mux_settle_us, self._verify,
+                       self._verify_tol)
+        # Inspect the LIVE state first: a scan recomputes values[] from the
+        # raws, which would erase exactly the divergence we are looking for.
+        out["mismatched_values"] = self._consistency()
+        out["pots"] = self.debug()
+        self.scan()
+
+        ref, agree, nref = self._consensus_capture()
+        out["reference_agreement"] = (agree, nref - 1)
+        out["reference"] = [None if a is None else round(a, 1) for a in ref]
+        out["aliases"] = self._aliases(ref, tol)
+        # Must be taken IMMEDIATELY after a reset sweep: that one leaves the
+        # counter parked at 15, so sweeping without a reset reads address-1 for
+        # every address. Taken later it would start at 0 by accident (a +1
+        # capture ends wrapped) and look falsely clean.
+        out["ctrl_parked15"] = self._classify(ref, self._capture(reset=False),
+                                              tol)
+
+        clean = 0
+        classes = {}
+        examples = []
+        for _ in range(int(sweeps)):
+            got = self._capture()
+            c = self._classify(ref, got, tol)
+            if c["same"] == NUM_POTS:
+                clean += 1
+            else:
+                key = "%d/%d/%d" % (c["prev"], c["next"], c["other"])
+                classes[key] = classes.get(key, 0) + 1
+                if len(examples) < 3:
+                    c["pots"] = [None if a is None else round(a, 1)
+                                 for a in got]
+                    examples.append(c)
+        out["sweeps"] = int(sweeps)
+        out["clean"] = clean
+        out["classes"] = classes       # "prev/next/other" -> how many sweeps
+        out["examples"] = examples
+
+        # Positive control: a deliberate whole-sweep +1 offset, the controlled
+        # version of a counter that took an extra edge.
+        out["ctrl_plus1"] = self._classify(ref, self._capture(extra=1), tol)
+
+        for _ in range(int(stress)):
+            self._reset_counter()
+            for _ in range(NUM_POTS):
+                self._pulse_counter()
+        out["stress"] = int(stress)
+        out["stress_after"] = self._classify(ref, self._capture(), tol)
+
+        out["retries"] = self._scan_retries
+        out["fallbacks"] = self._verify_fallbacks
+        out["pair_errors"] = [self._pair_err[i] for i in range(NUM_POTS)]
+        self._reseed()
+        return out
 
     def settle_delta(self, pot):
         """(d0, d1) = |real - dummy| of the last conversion of each wiper."""
