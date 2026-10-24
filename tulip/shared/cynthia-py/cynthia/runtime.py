@@ -2076,9 +2076,20 @@ def pot_selftest(sweeps=24, stress=40):
     if drv is None or not hasattr(drv, "selftest"):
         print("cynthia: no pot driver with a self-test loaded")
         return None
-    r = drv.selftest(sweeps=sweeps, stress=stress)
+    # Say how long it will block BEFORE it starts. A raw sweep is ~3ms at the
+    # default 100us settle, but the settle and the SPI clock are both tunable at
+    # runtime, and the settle dominates: 1000us settle + 100kHz SPI is ~50ms per
+    # sweep, i.e. >1s of silence overall.
+    settle = drv.mux_settle() if hasattr(drv, "mux_settle") else 100
+    per_ms = drv.sweep_us() / 1000.0 if hasattr(drv, "sweep_us") else 3.0
+    est_ms = per_ms * (sweeps + 8) + (stress * 17 * (settle + 10)) / 1000.0
+    print("cynthia: pot self-test — %.1f ms/sweep (settle %dus, spi %d Hz), so"
+          " about %.2f s. Leave the knobs alone."
+          % (per_ms, settle, drv.spi_baud(), est_ms / 1000.0))
+    r = drv.selftest(sweeps=sweeps, stress=stress,
+                     progress=lambda m: print("cynthia:   .. %s" % m))
     baud, settle, verify, tol = r["scan"]
-    print("cynthia: pot self-test — %d sweeps, stress %d, spi %d Hz, settle %dus,"
+    print("cynthia: report — %d sweeps, stress %d, spi %d Hz, settle %dus,"
           " verify %s (tol %d counts)"
           % (r["sweeps"], r["stress"], baud, settle, verify, tol))
     print("  pot | raw0 raw1 | angle | rejected pairs")
@@ -2119,7 +2130,10 @@ def pot_selftest(sweeps=24, stress=40):
     print("  retries %d, fallbacks %d, pair errors %s"
           % (r["retries"], r["fallbacks"], r["pair_errors"]))
     # verdict
-    if r["mismatched_values"]:
+    if r["sweeps"] < 1 and r["stress"] < 1:
+        verdict = ("INCOMPLETE: ran with sweeps=%d stress=%d - too little to"
+                   " conclude anything" % (r["sweeps"], r["stress"]))
+    elif r["mismatched_values"]:
         verdict = "SOFTWARE: values[] and the measurement have diverged"
     elif c1["same"] == len(r["pots"]):
         verdict = "INCONCLUSIVE: the +1 control did not trip the classifier"

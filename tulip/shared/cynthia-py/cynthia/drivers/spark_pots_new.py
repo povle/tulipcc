@@ -771,6 +771,17 @@ class Driver:
                     out.append((i + 1, j + 1))
         return out
 
+    def sweep_us(self):
+        """Modelled duration of one raw sweep in microseconds.
+
+        One address costs two ADC reads (each = two SPI transactions of 16
+        bit-times plus ADC_SETTLE_US) plus one counter pulse (10us high plus the
+        mux settle). Used only to warn how long the self-test will block - the
+        74HC393's settle is the dominant term and it is tunable at runtime.
+        """
+        per_read = (2 * 8 * 1000000.0) / self._spi_baud + ADC_SETTLE_US
+        return int(16 * (2 * per_read + self._mux_settle_us + 10))
+
     def _consensus_capture(self, n=5):
         """The capture the board agrees with itself about.
 
@@ -813,8 +824,12 @@ class Driver:
             self._delta[i] = 0.0
         self._has_delta = False
 
-    def selftest(self, sweeps=24, stress=40, tol=6.0):
+    def selftest(self, sweeps=24, stress=40, tol=6.0, progress=None):
         """Diagnose the pot path on-device and return a report dict.
+
+        `progress(msg)` is called at every phase boundary. This blocks for
+        hundreds of ms (seconds if the mux settle / SPI clock were tuned up), so
+        a caller that reports to a human should pass one.
 
         Leave the panel untouched: every comparison is against a reference
         capture, so a hand on a knob looks like a fault. Runs, in order:
@@ -830,15 +845,21 @@ class Driver:
         empty mismatched_values, while the positive controls still report
         `prev`/`next` - that is the test proving itself.
         """
+        def say(msg):
+            if progress is not None:
+                progress(msg)
+
         out = {}
         out["scan"] = (self._spi_baud, self._mux_settle_us, self._verify,
                        self._verify_tol)
+        say("checking values[] against the raws it came from")
         # Inspect the LIVE state first: a scan recomputes values[] from the
         # raws, which would erase exactly the divergence we are looking for.
         out["mismatched_values"] = self._consistency()
         out["pots"] = self.debug()
         self.scan()
 
+        say("taking 5 reference sweeps (they must agree with each other)")
         ref, agree, nref = self._consensus_capture()
         out["reference_agreement"] = (agree, nref - 1)
         out["reference"] = [None if a is None else round(a, 1) for a in ref]
@@ -850,6 +871,8 @@ class Driver:
         out["ctrl_parked15"] = self._classify(ref, self._capture(reset=False),
                                               tol)
 
+        say("census: %d untouched sweeps, %d ms each" % (
+            int(sweeps), self.sweep_us() // 1000))
         clean = 0
         classes = {}
         examples = []
@@ -870,10 +893,12 @@ class Driver:
         out["classes"] = classes       # "prev/next/other" -> how many sweeps
         out["examples"] = examples
 
+        say("positive controls: +1 offset and a parked counter")
         # Positive control: a deliberate whole-sweep +1 offset, the controlled
         # version of a counter that took an extra edge.
         out["ctrl_plus1"] = self._classify(ref, self._capture(extra=1), tol)
 
+        say("stress: %d rounds of reset+16 pulses" % int(stress))
         for _ in range(int(stress)):
             self._reset_counter()
             for _ in range(NUM_POTS):
@@ -884,6 +909,7 @@ class Driver:
         out["retries"] = self._scan_retries
         out["fallbacks"] = self._verify_fallbacks
         out["pair_errors"] = [self._pair_err[i] for i in range(NUM_POTS)]
+        say("restoring the filter state")
         self._reseed()
         return out
 
