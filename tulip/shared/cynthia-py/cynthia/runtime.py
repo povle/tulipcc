@@ -1032,14 +1032,21 @@ def _poll(tick):
     the whole body is guarded, and the traceback is printed a bounded number of
     times so a recurring fault cannot flood the console and starve the REPL."""
     global _tick, _poll_faults
-    if not _running or _STOP_POLL:
-        return
-    # Feed the hardware watchdog first: the whole point is that this callback is
-    # the liveness signal a stuck sketch cannot provide. Put before anything that
-    # could itself be slow, so a heavy poll still counts as alive — and before the
-    # try/except, so a fault in the body does not also stop the feed.
+    # Feed the hardware watchdog FIRST AND UNCONDITIONALLY: this callback is the
+    # liveness signal a stuck sketch cannot provide. It must happen before every
+    # early return and before anything that could itself be slow, so a heavy poll
+    # still counts as alive, and before the try/except, so a fault in the body
+    # does not also stop the feed.
+    #
+    # Learned the hard way: the feed used to sit AFTER the `_STOP_POLL` check, so
+    # pausing the UI to take a clean measurement also stopped the watchdog - 60s
+    # later the board reset, six of those in a row tripped guard's WDT safe mode,
+    # and the panel came up with a garbled screen and no input. A debug pause
+    # must not be able to reboot the board.
     if hasattr(tulip, "cynthia_wdt_feed"):
         tulip.cynthia_wdt_feed()
+    if not _running or _STOP_POLL:
+        return
     try:
         _poll_body(tick)
     except Exception as e:
