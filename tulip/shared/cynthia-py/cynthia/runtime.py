@@ -2056,6 +2056,48 @@ def pot_settle():
     return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
 
 
+def set_pot_reverse(on=True):
+    """REPL: negate rotation for the odd-indexed pots (P2, P4, ...).
+
+    The pots on the back of the panel run the other way for the same physical
+    turn. WHICH pots those are is a property of the panel, not of the driver, so
+    this is a live switch: turn one back-side knob and one front-side knob the
+    same way, and if they move a parameter in opposite directions, flip this.
+    Persisted per board in daughterboard.json as `reverse_odd_pots`.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_reverse_odd"):
+        print("cynthia: no pot driver with a reversal control")
+        return None
+    on = drv.set_reverse_odd(on)
+    try:
+        toast("odd pots reversed" if on else "odd pots normal", 1200)
+    except Exception:
+        pass
+    print("cynthia: reverse_odd_pots = %s" % on)
+    return on
+
+
+def set_pot_trust(counts):
+    """REPL: how close to a wiper's end of travel it stops being trusted
+    (counts, default TRUST_RAW=220).
+
+    A wiper inside this band reads a plausible but WRONG angle near the ends of
+    its track, so it must lose to its partner rather than be used to reject it.
+    Raise it if a range of angles still reads dead (a wiper that is wrong but
+    still "alive" gets vetoed); lower it if the single-wiper stretches look
+    noisy. Above ~240 the two wipers' bands start to overlap and a small arc of
+    the turn goes dead, which is the bug this replaces.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_trust_raw"):
+        print("cynthia: no pot driver with a trust control")
+        return None
+    n = drv.set_trust_raw(counts)
+    print("cynthia: pot trust_raw = %d counts" % n)
+    return n
+
+
 def pot_timing():
     """REPL: the live pot timing knobs and what one sweep costs at them.
 
@@ -2075,9 +2117,11 @@ def pot_timing():
     if per_us is not None and rate is not None and per_us / 1000.0 > rate:
         warn = ("  <-- a sweep costs MORE than the scan period, so the poll can"
                 " never idle: fix settle/spi first")
-    print("cynthia: settle %sus, spi %s Hz, %.1f ms per sweep, scan every %s ms%s"
-          % (settle, baud, (per_us or 0) / 1000.0, rate, warn))
-    return (settle, baud, per_us, rate)
+    rev = drv.reverse_odd() if hasattr(drv, "reverse_odd") else None
+    print("cynthia: settle %sus, spi %s Hz, %.1f ms per sweep, scan every %s ms,"
+          " reverse_odd=%s%s"
+          % (settle, baud, (per_us or 0) / 1000.0, rate, rev, warn))
+    return (settle, baud, per_us, rate, rev)
 
 
 def pot_step(steps=4):

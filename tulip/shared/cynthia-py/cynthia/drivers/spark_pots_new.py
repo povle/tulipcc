@@ -52,6 +52,19 @@ WIPER_RANGE_DEG = 340.0
 # code trusted the bad one and produced a stable-but-wrong angle.
 DEADZONE_RAW = 100
 
+# Counts from either end of a wiper's own travel below which that wiper is not
+# merely "railed" but *unreliable*: it reads a plausible-looking number that is
+# slightly wrong. Between DEADZONE_RAW and this, the wiper must LOSE to its
+# partner, not be used to reject it.
+#
+# That distinction is the whole 164..180 dead window: there, wiper 1 is just off
+# its end (raw ~900, i.e. inside 923 so "not railed") and reads ~50 deg off, so
+# the pair-agreement test rejected the sample and the pot looked dead across
+# that range even though wiper 0 was perfectly good. 250 counts ~= 83 deg of
+# travel reserved as unusable at each end; the two wipers are 180 deg apart, so
+# they cannot both be inside it and coverage of the full 360 stays complete.
+TRUST_RAW = 220
+
 # While BOTH wipers are on-track they describe the same physical angle, 180 deg
 # apart, so their two estimates must agree. Mechanical play and wiper tolerance
 # are a few degrees; a disagreement of tens of degrees means the channels are
@@ -386,55 +399,54 @@ class Driver:
 
     # --- angle math (ported from computeAngle) ---
 
+    def _wiper_dist(self, raw):
+        """Distance from a wiper's own end of travel, in counts (0..511).
+
+        Each wiper's track is 340 deg long, so its dead zones are at raw near 0
+        and near 1023 and BOTH ends matter. Measuring from one end only made a
+        wiper sitting just off raw=0 look maximally safe and win the tie.
+        """
+        other = 1023 - raw
+        return raw if raw < other else other
+
     def _compute_angle(self, raw0, raw1):
         ang0 = (raw0 / 1023.0) * WIPER_RANGE_DEG           # 0..340
         ang1 = (raw1 / 1023.0) * WIPER_RANGE_DEG + 180.0   # 180..520
         if ang1 >= 360.0:
             ang1 -= 360.0
-        # A dead wiper reads near the ADC rails.
-        w0_rails = raw0 < DEADZONE_RAW or raw0 > (1023 - DEADZONE_RAW)
-        w1_rails = raw1 < DEADZONE_RAW or raw1 > (1023 - DEADZONE_RAW)
+        d0 = self._wiper_dist(raw0)
+        d1 = self._wiper_dist(raw1)
+        trust0 = d0 > TRUST_RAW
+        trust1 = d1 > TRUST_RAW
         # Wrap-aware disagreement between the two estimates of the same angle.
         diff = ang1 - ang0
         if diff > 180.0:
             diff -= 360.0
         elif diff < -180.0:
             diff += 360.0
-        # Both wipers on-track: a large disagreement cannot be mechanical play,
-        # so the pair is reading different sensors. Reject before reconciling.
-        if not w0_rails and not w1_rails:
+
+        if trust0 and trust1:
+            # Both wipers comfortably in their linear range: a large
+            # disagreement cannot be mechanical play, so the pair is reading
+            # different sensors. Reject before reconciling.
             if diff > PAIR_TOL_DEG or diff < -PAIR_TOL_DEG:
                 return None
-        # Do the two angles agree closely (within 2 deg)?
-        if diff < 2.0 and diff > -2.0:
-            return ang0 + diff * 0.5
-        # Disagree: one wiper is in its deadzone.
-        if w0_rails and not w1_rails:
-            return ang1
-        if w1_rails and not w0_rails:
+            if diff < 2.0 and diff > -2.0:
+                return ang0 + diff * 0.5
+            # Agree within tolerance but not exactly: trust the wiper that is
+            # further from its end.
+            return ang0 if d0 > d1 else ang1
+
+        # Exactly one wiper is in a region where it reads plausibly but wrongly.
+        # Use the other one: it is the only trustworthy source for this angle,
+        # and using the bad one to veto it is what made 164..180 dead.
+        if trust0:
             return ang0
-        if not w0_rails and not w1_rails:
-            # Neither near the rails: use the wiper farther from its deadzone.
-            #
-            # Wiper 0's dead zones are at BOTH ends of its 340 deg travel
-            # (raw near 0 and near 1023), so its distance is the nearer of the
-            # two. Only measuring from the 340 end made a wiper sitting just
-            # off raw=0 look maximally safe and picked its noisy value.
-            dist0 = ang0
-            if 340.0 - ang0 < dist0:
-                dist0 = 340.0 - ang0
-            # Wiper 1 is offset by 180 deg, so its dead zones land at 160 and
-            # 180 after normalisation.
-            d160 = ang1 - 160.0
-            if d160 < 0:
-                d160 = -d160
-            d180 = ang1 - 180.0
-            if d180 < 0:
-                d180 = -d180
-            dist1 = d160 if d160 < d180 else d180
-            return ang0 if dist0 > dist1 else ang1
-        # Both wipers in (or near) their dead zones. At a genuine boundary angle
-        # only ONE wiper is dead, so this is a corrupt pair, not a position.
+        if trust1:
+            return ang1
+        # Neither wiper is trustworthy (both within TRUST_RAW of an end). With a
+        # 180 deg offset that cannot happen for a real position, so the pair is
+        # corrupt.
         return None
 
     # --- scan ---
@@ -479,12 +491,14 @@ class Driver:
 
     def _pair_ok(self, raw0, raw1):
         """Side-effect-free version of the pair test (see _compute_angle)."""
-        w0 = raw0 < DEADZONE_RAW or raw0 > (1023 - DEADZONE_RAW)
-        w1 = raw1 < DEADZONE_RAW or raw1 > (1023 - DEADZONE_RAW)
-        if w0 and w1:
-            return False          # at a real boundary only ONE wiper is dead
-        if w0 or w1:
-            return True           # the live wiper carries the angle
+        t0 = self._wiper_dist(raw0) > TRUST_RAW
+        t1 = self._wiper_dist(raw1) > TRUST_RAW
+        if t0 and t1:
+            pass                  # both trusted: the angle test below decides
+        elif t0 or t1:
+            return True           # the trustworthy wiper carries the angle
+        else:
+            return False          # at a real position both cannot be near ends
         a0 = (raw0 / 1023.0) * WIPER_RANGE_DEG
         a1 = ((raw1 / 1023.0) * WIPER_RANGE_DEG + 180.0) % 360.0
         d = a1 - a0
@@ -501,36 +515,41 @@ class Driver:
                 n += 1
         return n
 
-    def _verify_upper(self):
-        """Re-read addresses 8..15 and count how many disagree with pass one.
+    def _verify_sweep(self):
+        """Re-read the LAST address and count how many channels disagree with
+        pass one.
 
-        A slipped counter changes every read after the extra or missed edge, so
-        two passes over the same addresses cannot agree while a pot is static.
-        This is the only check that can catch a slip in the half where the two
-        muxes happen to select the same sensor.
+        A slip anywhere in the sweep (an edge gained or lost at any point)
+        changes what the final address holds, so one address gives full coverage
+        of the upper half - the half where the pair check is blind, because for
+        addresses 8..15 both muxes select the same sensor and a slipped read is
+        still a self-consistent pair filed under the neighbour.
+
+        One address, not eight, because this runs inside the UI poll: _seek()
+        steps with 20us pulses and a single settle, so the whole check is ~0.6ms
+        against ~2ms for re-reading the half. Folded into a bigger scan you
+        cannot spend that on every sweep and keep the UI responsive.
         """
-        self._seek(8)
-        for addr in range(8, NUM_POTS):
-            ch1 = self._read_adc(1)
-            ch0 = self._read_adc(0)
-            self._v0[MUX0_MAP[addr] - 1] = ch0
-            self._v1[MUX1_MAP[addr] - 1] = ch1
-            if addr < NUM_POTS - 1:
-                self._pulse_counter()
+        addr = NUM_POTS - 1
+        self._seek(addr)
+        ch1 = self._read_adc(1)
+        ch0 = self._read_adc(0)
+        i = MUX0_MAP[addr] - 1          # == MUX1_MAP[addr] - 1 for 8..15
         bad = 0
-        for i in range(8, NUM_POTS):
-            d0 = self._phase0[i] - self._v0[i]
-            d1 = self._phase1[i] - self._v1[i]
-            if d0 < 0:
-                d0 = -d0
-            if d1 < 0:
-                d1 = -d1
-            if d0 > self._verify_tol or d1 > self._verify_tol:
-                bad += 1
-            else:
-                # Both passes agree: average them, which also halves the noise.
-                self._phase0[i] = (self._phase0[i] + self._v0[i]) // 2
-                self._phase1[i] = (self._phase1[i] + self._v1[i]) // 2
+        d = self._phase0[i] - ch0
+        if d < 0:
+            d = -d
+        if d > self._verify_tol:
+            bad += 1
+        else:
+            self._phase0[i] = (self._phase0[i] + ch0) // 2
+        d = self._phase1[i] - ch1
+        if d < 0:
+            d = -d
+        if d > self._verify_tol:
+            bad += 1
+        else:
+            self._phase1[i] = (self._phase1[i] + ch1) // 2
         return bad
 
     def _scan_all(self):
@@ -542,7 +561,7 @@ class Driver:
             if self._bad_pair_count() > SHIFT_BAD_PAIRS:
                 self._scan_retries += 1
                 continue
-            if self._verify and self._verify_upper() > VERIFY_BAD_MAX:
+            if self._verify and self._verify_sweep() > VERIFY_BAD_MAX:
                 self._scan_retries += 1
                 continue
             for i in range(NUM_POTS):
@@ -1163,6 +1182,31 @@ class Driver:
     def timing(self):
         """(spi_baudrate, mux_settle_us) currently in use."""
         return (self._spi_baud, self._mux_settle_us)
+
+    def set_reverse_odd(self, on=True):
+        """Flip the rotation direction of the odd-indexed pots (or all of them
+        off). The back-of-board pots are wired so their wiper runs the other
+        way for the same physical turn; which set is affected is a property of
+        the panel, not of the driver, so it must be tunable without a rebuild.
+        """
+        self._reverse_odd = bool(on)
+        return self._reverse_odd
+
+    def reverse_odd(self):
+        """True when odd-indexed (1-based P2, P4, ..) rotation is negated."""
+        return self._reverse_odd
+
+    def set_trust_raw(self, counts):
+        """Distance from a wiper's end of travel below which it loses to its
+        partner instead of vetoing it (see TRUST_RAW). Diagnostic aid."""
+        counts = int(counts)
+        if counts < 0:
+            counts = 0
+        elif counts > 500:
+            counts = 500
+        global TRUST_RAW
+        TRUST_RAW = counts
+        return TRUST_RAW
 
     def set_delta_deadband(self, deg):
         """Change the rotation hysteresis at runtime (diagnostic aid)."""
