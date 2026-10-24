@@ -255,7 +255,7 @@ def _seed_pot_positions():
 
 def _apply_knob_deltas(now):
     """Relative mode: move each parameter by the rotation just reported."""
-    global _last_knob_ch, _last_knob_time
+    global _last_knob_ch, _last_knob_time, _last_knob_src
     for ch, d in surface.knob_deltas():
         if ch < 0 or ch >= 16:
             continue
@@ -275,6 +275,7 @@ def _apply_knob_deltas(now):
         _pot_pos[ch] = p
         _engine.update_pot(target, p)
         _last_knob_ch = target
+        _last_knob_src = ch
         _last_knob_time = now
         mark_dirty()
 
@@ -1068,6 +1069,7 @@ def _poll(tick):
 def _poll_body(tick):
     """The actual poll work, split out so _poll can guard it as a unit."""
     global _tick, _stable_after, _last_knob_ch, _last_knob_time, _dirty
+    global _last_knob_src
     now = time.ticks_ms()
     surface.poll(now)
 
@@ -1095,6 +1097,7 @@ def _poll_body(tick):
                 # Record the MAPPED channel so the overlay names the parameter
                 # that actually changed.
                 _last_knob_ch = target
+                _last_knob_src = ch
                 _last_knob_time = now
                 mark_dirty()
 
@@ -1201,7 +1204,8 @@ def _poll_body(tick):
         _draw_ui()
 
 _last_joy = None
-_last_knob_ch = -1
+_last_knob_ch = -1      # mapped engine channel of the last knob that moved
+_last_knob_src = -1     # physical knob that moved (indexes _pot_pos)
 _last_knob_time = 0
 
 # --- joystick nav: edge-triggered stepping -------------------------------
@@ -2807,25 +2811,38 @@ def _draw_ui(force=False):
         else:
             _pname = "Ch %d" % _last_knob_ch
         disp.draw_str(display.FONT_5X7, 2, 7, _pname, 1)
-        # Value display: knob percentage
-        kn = surface.knobs()
-        if _last_knob_ch < len(kn):
-            pct = int(kn[_last_knob_ch] * 100)
-            val_str = "%d%%" % pct
-            disp.draw_str(display.FONT_5X7, 100, 7, val_str, 1)
+        # Value display: the PARAMETER's value, never the knob's physical angle.
+        #
+        # Endless knobs report ROTATION, and their physical angle wraps 360->0,
+        # so showing surface.knobs() made this readout jump from 100% to 0% in
+        # the middle of a turn, and disagree with the instrument's own screen
+        # (which draws the patch field) - the "Juno UI is out of sync with the
+        # top bar" report. Reading it back from the engine when it can also
+        # picks up quantisation (HPF's 4 steps, saw on/off), so the header and
+        # the instrument screen are the same number by construction.
+        val = None
+        if _engine is not None and _last_knob_ch >= 0 and hasattr(_engine, "get_pot"):
+            try:
+                val = _engine.get_pot(_last_knob_ch)
+            except Exception:
+                val = None
+        if val is None and 0 <= _last_knob_src < len(_pot_pos):
+            val = _pot_pos[_last_knob_src]
+        disp.hline(0, 10, display.WIDTH, 1)
+        if val is not None:
+            if val < 0.0:
+                val = 0.0
+            elif val > 1.0:
+                val = 1.0
+            disp.draw_str(display.FONT_5X7, 100, 7, "%d%%" % int(val * 100), 1)
+            bw = int(126 * val)
+            if bw > 0:
+                disp.fill_rect(1, 9, bw, 1, 1)
         # Center: instrument name
         text_w = disp.str_width(display.FONT_RESOLEDBOLD, inst_title)
         start_x = max(0, (display.WIDTH - text_w) // 2)
         disp.draw_str(display.FONT_RESOLEDBOLD, start_x, 7, inst_title, 1)
-        # A one-pixel bar under the row: a percentage alone does not show where
-        # the knob sits; this makes a sweep readable at a glance.
-        if _last_knob_ch < len(kn):
-            bw = int(126 * max(0.0, min(1.0, kn[_last_knob_ch])))
-            disp.hline(0, 10, display.WIDTH, 1)
-            if bw > 0:
-                disp.fill_rect(1, 9, bw, 1, 1)
-        else:
-            disp.hline(0, 10, display.WIDTH, 1)
+        # (the one-pixel bar under the row is drawn above, from `val`)
     else:
         # Normal header: battery voltage, not joystick
         batt_v = None
