@@ -449,6 +449,16 @@ Driver notes worth keeping:
   rt.pot_debug(0)          # on-screen scope for one pot (also Settings >
                            # Pots debug, which returns there on exit)
   ```
+  The scope does NOT narrow the scan: the mux keeps cycling all 16 addresses at
+  the current rate, and the screen only displays one pot's slice. Left/right on
+  the stick changes the scan rate live (20/50/100/200/500/1000 ms, then OFF);
+  the rate is shown top-right and OFF parks the counter so a channel can be
+  probed with a meter while it is not being switched. With the scan stopped, a
+  click performs one scan instead of leaving the screen (the bottom line says
+  `click=1 scan`); leaving the scope always restores 20 ms so the knobs are not
+  left frozen. `rt.set_pot_scan_rate(ms|None)` and `rt.pot_scan_rate()` do the
+  same from the REPL. Note `rt.trace_pot()` scans directly on top of the poll,
+  so its rejection counts climb faster than the steady-state rate.
   The scope draws both raw wiper channels as bars (filtered values, with the
   raw counts printed under them), ticks at the raw count the second wiper
   should have (that 180-degree offset, +/- the tolerance band), plus the

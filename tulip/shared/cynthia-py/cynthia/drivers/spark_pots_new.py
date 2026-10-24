@@ -176,6 +176,11 @@ class Driver:
         # frame to redraw colours that had not changed.
         self._led_shown = [None] * NUM_POTS
         self._last_scan_ms = None
+        # Scan pacing, adjustable at runtime (the pot scope exposes it): None
+        # means stopped, which parks the mux so a channel can be probed with a
+        # meter while it is not being switched.
+        self._scan_period_ms = SCAN_PERIOD_MS
+        self._scan_saved_ms = SCAN_PERIOD_MS
         # NeoPixels (optional, §10.2) — only if configured.
         self._leds = None
         self._led_mode = "auto"
@@ -428,14 +433,46 @@ class Driver:
         if now_ms is None:
             import time
             now_ms = time.ticks_ms()
+        period = self._scan_period_ms
+        if period is None:
+            return
         last = self._last_scan_ms
-        if last is not None and _ticks_diff(now_ms, last) < SCAN_PERIOD_MS:
+        if last is not None and _ticks_diff(now_ms, last) < period:
             return
         self._last_scan_ms = now_ms
         self.scan()
 
     def knobs(self):
         """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
+        return self.values
+
+    def set_scan_period(self, ms):
+        """Scan every `ms` milliseconds, or None to stop scanning entirely.
+
+        Stopping leaves the mux counter where it is, so a scope/meter can look
+        at a settled channel instead of one that switches every few ms.
+        """
+        if ms is None:
+            if self._scan_period_ms is not None:
+                self._scan_saved_ms = self._scan_period_ms
+            self._scan_period_ms = None
+        else:
+            ms = int(ms)
+            if ms < 1:
+                ms = 1
+            self._scan_period_ms = ms
+            self._scan_saved_ms = ms
+        return self._scan_period_ms
+
+    def scan_period(self):
+        return self._scan_period_ms
+
+    def scan_enabled(self):
+        return self._scan_period_ms is not None
+
+    def scan_once(self):
+        """Force one scan regardless of the pacing/stop state."""
+        self.scan()
         return self.values
 
     def debug(self):
