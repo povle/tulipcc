@@ -76,3 +76,23 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # Leaving the NVS store enabled only pulls flash-write machinery into the radio
 # path for no benefit.
 CONFIG_BT_NIMBLE_NVS_PERSIST=n
+
+# --- Power management OFF -------------------------------------------------
+# CONFIG_PM_ENABLE was y in the generated build/sdkconfig (set once from an
+# interactive session, never in this file, so it survived every incremental
+# build). On this board that has two costs:
+#
+#  1. TIMING. With esp_pm active the CPU clock is scaled and the CPU can idle
+#     into light sleep, and time.ticks_us()/ticks_ms() come out badly wrong:
+#     measured against the host, a raw pot sweep "takes" 3.5 s instead of ~15 ms
+#     and time.sleep_us(10) "takes" 32 ms. Everything paced on MicroPython ticks
+#     then fires far too often - the pot driver's 20 ms scan period runs
+#     back-to-back and starves the UI poll, which is the "sluggish UI"
+#     complaint, while the knobs themselves still behave.
+#  2. AUDIO. Frequency scaling moves the clock the I2S master generates, and
+#     the PCM5102A is clocked from that.
+#
+# Nothing in the tree selects PM_ENABLE, so pinning it off here is safe and
+# makes a fresh build match a working one.
+CONFIG_PM_ENABLE=n
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n
