@@ -96,6 +96,12 @@ SCAN_RETRIES = 3
 SELFTEST_BUDGET_MS = 2000
 SELFTEST_MIN_SWEEPS = 4
 
+# A mux settle this long is a misconfiguration, not a setting: a sweep is 16
+# addresses, so 5ms each already costs ~80ms per sweep and cannot keep up with
+# the 20ms scan period - and the self-test would spend seconds discovering that.
+# Checked before ANY hardware access (even the calibration sweep).
+SETTLE_SANE_US = 5000
+
 # The pair check cannot see a slip in the SECOND half of the sweep: for
 # addresses 8..15 both muxes select the same sensor (see MUX0_MAP/MUX1_MAP), so
 # a one-step shift still yields a perfectly consistent pair - it is just filed
@@ -780,6 +786,35 @@ class Driver:
                     out.append((i + 1, j + 1))
         return out
 
+    def bench(self, iters=20, cap_us=200000):
+        """Time the pot path's primitives in microseconds each.
+
+        When a scan is much slower than sweep_us() predicts, the argument says
+        which primitive is to blame - sleep_us() rounding up to an RTOS tick,
+        the SPI transfer, or the counter pulse (which sums 16 sleeps per sweep).
+        Every measurement stops after `cap_us` so this is bounded even when the
+        answer is "this primitive is catastrophically slow".
+        """
+        out = []
+
+        def timed(label, fn, n, cap):
+            t0 = time.ticks_us()
+            done = 0
+            for _ in range(n):
+                fn()
+                done += 1
+                if time.ticks_diff(time.ticks_us(), t0) > cap:
+                    break
+            out.append((label, time.ticks_diff(time.ticks_us(), t0) / done, done))
+
+        timed("sleep_us(10)", lambda: time.sleep_us(10), iters, cap_us)
+        timed("sleep_us(100)", lambda: time.sleep_us(100), iters, cap_us)
+        timed("adc read", lambda: self._read_adc(0), iters, cap_us)
+        timed("counter reset", self._reset_counter, iters, cap_us)
+        timed("counter pulse", self._pulse_counter, iters, cap_us)
+        timed("raw sweep", self._capture, 4, 3 * cap_us)
+        return out
+
     def sweep_us(self):
         """Modelled duration of one raw sweep in microseconds.
 
@@ -858,14 +893,55 @@ class Driver:
         def say(msg):
             if progress is not None:
                 progress(msg)
+            # Feed the OS a tick. A pot scan is thousands of time.sleep_us()
+            # calls, and on this port those BUSY-WAIT (mphalport.c: the loop only
+            # services pending Python events, it never yields), so a long run of
+            # them starves every other FreeRTOS task - including whatever drains
+            # the CDC. That is why progress output can arrive late or truncated.
+            time.sleep_ms(1)
 
         out = {}
         out["scan"] = (self._spi_baud, self._mux_settle_us, self._verify,
                        self._verify_tol)
 
-        # Fit the requested work into the budget BEFORE doing any of it.
-        per_sweep_us = self.sweep_us()
-        per_stress_us = 17 * (self._mux_settle_us + 10)
+        # Refuse on a bad configuration WITHOUT touching the hardware. The
+        # calibration below costs real time, so it must not run first: at a 1s
+        # settle one sweep is 16s and the "measurement" itself would take 34s.
+        model_sweep_us = self.sweep_us()
+        out["modelled_us"] = model_sweep_us
+        if self._mux_settle_us > SETTLE_SANE_US:
+            out["error"] = (
+                "mux settle is %d us, above the %d us sanity limit: a sweep is"
+                " 16 addresses so that is %.0f ms per scan, which cannot keep up"
+                " with the scan period either. Set it back with"
+                " rt.set_pot_settle(100) (or fix mux_settle_us in"
+                " daughterboard.json)." % (self._mux_settle_us, SETTLE_SANE_US,
+                                           model_sweep_us / 1000.0))
+            return out
+        if model_sweep_us * SELFTEST_MIN_SWEEPS > int(budget_ms * 8 // 10) * 1000:
+            out["error"] = (
+                "even the modelled sweep cost (%.1f ms) blows the %d ms budget"
+                " over %d sweeps, so there is nothing to measure. Check"
+                " rt.pot_timing()." % (model_sweep_us / 1000.0, int(budget_ms),
+                                       SELFTEST_MIN_SWEEPS))
+            return out
+
+        # Fit the requested work into the budget BEFORE doing any of it, and
+        # MEASURE rather than model: if a sleep costs far more than its
+        # argument (or the board is loaded), a modelled budget never engages and
+        # the test runs unbounded. Costs ~5ms.
+        t0 = time.ticks_us()
+        self._capture()
+        measured_sweep = time.ticks_diff(time.ticks_us(), t0)
+        t0 = time.ticks_us()
+        self._reset_counter()
+        for _ in range(NUM_POTS):
+            self._pulse_counter()
+        measured_stress = time.ticks_diff(time.ticks_us(), t0)
+        out["measured_us"] = measured_sweep
+        per_sweep_us = measured_sweep if measured_sweep > 0 else self.sweep_us()
+        per_stress_us = (measured_stress if measured_stress > 0
+                         else 17 * (self._mux_settle_us + 10))
         # Fit to 80% of the budget: sweep_us() models a raw sweep and does not
         # include the verification re-read that scan() also performs, so it
         # reads ~15% low (measured against a sleep/bit-time model of the whole
@@ -879,6 +955,8 @@ class Driver:
         out["budget_ms"] = int(budget_ms)
         out["scaled"] = (run_sweeps, want_sweeps, run_stress, want_stress)
         out["sweep_us"] = per_sweep_us
+        say("measured %d us per sweep (model says %d us)"
+            % (measured_sweep, out["modelled_us"]))
         if run_sweeps < SELFTEST_MIN_SWEEPS:
             out["error"] = (
                 "one sweep costs %d us at settle %d us / spi %d Hz, so even %d"
@@ -908,7 +986,7 @@ class Driver:
         out["ctrl_parked15"] = self._classify(ref, self._capture(reset=False),
                                               tol)
 
-        say("census: %d untouched sweeps, %d ms each" % (
+        say("census: %d untouched sweeps, %d ms each measured" % (
             run_sweeps, per_sweep_us // 1000))
         clean = 0
         classes = {}

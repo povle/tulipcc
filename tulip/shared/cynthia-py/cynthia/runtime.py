@@ -2080,6 +2080,35 @@ def pot_timing():
     return (settle, baud, per_us, rate)
 
 
+def pot_bench(iters=20):
+    """REPL: attribute a slow pot scan to one primitive (microseconds each).
+
+    Bounded - each measurement gives up after 200ms. If a scan takes far longer
+    than rt.pot_timing() predicts, this says which primitive is responsible:
+    sleep_us() can round up to an RTOS tick, and the counter pulse sums 16
+    sleeps per sweep, so that one rounding is multiplied 16x per sweep and again
+    by every sweep the self-test runs.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "bench"):
+        print("cynthia: no pot driver with a bench")
+        return None
+    rows = drv.bench(iters=iters)
+    print("cynthia: pot primitive timing (microseconds each):")
+    seen = {}
+    for label, us, n in rows:
+        seen[label] = us
+        print("  %-14s %9.1f us   (%d iters)" % (label, us, n))
+    implied = 16 * (2 * seen.get("adc read", 0) + seen.get("counter pulse", 0))
+    print("  -> a sweep costs %.1f ms by measurement, vs %.1f ms modelled"
+          % (implied / 1000.0, drv.sweep_us() / 1000.0))
+    for label, us, _n in rows:
+        if label.startswith("sleep_us") and us > 5 * float(label[9:-1]):
+            print("  !! %s costs %.0f us - sleeps are being rounded up, which"
+                  " multiplies by 16 per sweep" % (label, us))
+    return rows
+
+
 def pot_selftest(sweeps=24, stress=40):
     """REPL: diagnose the pot path with nothing but the panel attached.
 
@@ -2107,11 +2136,9 @@ def pot_selftest(sweeps=24, stress=40):
     settle = drv.mux_settle() if hasattr(drv, "mux_settle") else 100
     per_ms = drv.sweep_us() / 1000.0 if hasattr(drv, "sweep_us") else 3.0
     est_ms = per_ms * (sweeps + 8) + (stress * 17 * (settle + 10)) / 1000.0
-    budget_ms = getattr(drv, "SELFTEST_BUDGET_MS", 2000)
-    print("cynthia: pot self-test — %.1f ms/sweep (settle %dus, spi %d Hz), so"
-          " about %.2f s, capped at %.1f s. Leave the knobs alone. Ctrl-C stops"
-          " it." % (per_ms, settle, drv.spi_baud(), est_ms / 1000.0,
-                    budget_ms / 1000.0))
+    print("cynthia: pot self-test — %.1f ms/sweep modelled (settle %dus, spi %d"
+          " Hz), so about %.2f s, and it is capped. Leave the knobs alone."
+          " Ctrl-C stops it." % (per_ms, settle, drv.spi_baud(), est_ms / 1000.0))
 
     def _say(msg):
         print("cynthia:   .. %s" % msg)
@@ -2143,6 +2170,12 @@ def pot_selftest(sweeps=24, stress=40):
     if r["aliases"]:
         print("  pots currently at the same angle (compare with what is shown): %s"
               % ", ".join("P%02d=P%02d" % a for a in r["aliases"]))
+    if r.get("measured_us"):
+        print("  timing: measured %d us/sweep vs %d us modelled%s"
+              % (r["measured_us"], r.get("modelled_us", 0),
+                 "  <-- the port is far slower than its arguments suggest"
+                 if r["measured_us"] > 3 * max(1, r.get("modelled_us", 1))
+                 else ""))
     agree, need = r["reference_agreement"]
     if agree < need:
         print("  reference agreement %d/%d — the board did NOT agree with itself"
