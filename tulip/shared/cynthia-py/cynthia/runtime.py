@@ -2056,45 +2056,47 @@ def pot_settle():
     return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
 
 
-def set_pot_reverse(on=True):
-    """REPL: negate rotation for the odd-indexed pots (P2, P4, ...).
+def set_pot_reverse(parity="odd"):
+    """REPL: which pots have their rotation negated - "odd" (P2, P4, ...),
+    "even" (P1, P3, ...) or "off".
 
     The pots on the back of the panel run the other way for the same physical
-    turn. WHICH pots those are is a property of the panel, not of the driver, so
-    this is a live switch: turn one back-side knob and one front-side knob the
-    same way, and if they move a parameter in opposite directions, flip this.
+    turn. Which set that is, is a property of the panel, so being able to say
+    "the other parity" matters: if "odd" is set and a back knob still moves a
+    parameter the wrong way, the mirrored pots are the even ones.
     Persisted per board in daughterboard.json as `reverse_odd_pots`.
     """
     drv = _pot_driver()
-    if drv is None or not hasattr(drv, "set_reverse_odd"):
+    if drv is None or not hasattr(drv, "set_reverse_parity"):
         print("cynthia: no pot driver with a reversal control")
         return None
-    on = drv.set_reverse_odd(on)
+    p = drv.set_reverse_parity(parity)
+    label = {None: "off", 0: "even (P1, P3, ..)", 1: "odd (P2, P4, ..)"}[p]
     try:
-        toast("odd pots reversed" if on else "odd pots normal", 1200)
+        toast("reverse %s" % label, 1200)
     except Exception:
         pass
-    print("cynthia: reverse_odd_pots = %s" % on)
-    return on
+    print("cynthia: reverse = %s" % label)
+    return p
 
 
-def set_pot_trust(counts):
-    """REPL: how close to a wiper's end of travel it stops being trusted
-    (counts, default TRUST_RAW=220).
+def set_pot_deadzone(counts):
+    """REPL: how close to a wiper's end of travel it becomes unusable (counts,
+    default DEADZONE_RAW=100).
 
-    A wiper inside this band reads a plausible but WRONG angle near the ends of
-    its track, so it must lose to its partner rather than be used to reject it.
-    Raise it if a range of angles still reads dead (a wiper that is wrong but
-    still "alive" gets vetoed); lower it if the single-wiper stretches look
-    noisy. Above ~240 the two wipers' bands start to overlap and a small arc of
-    the turn goes dead, which is the bug this replaces.
+    Each wiper's track is 340 of the 360 deg, so its ends are dead: it reads the
+    rail, or worse reads plausibly while being wrong. Near an end the OTHER
+    wiper always carries the angle, so raising this only decides how early the
+    hand-over happens. Raise it if a range of angles is still rejected (a
+    compressed wiper spoiling its partner's sample); it costs nothing but
+    resolution at the ends.
     """
     drv = _pot_driver()
-    if drv is None or not hasattr(drv, "set_trust_raw"):
-        print("cynthia: no pot driver with a trust control")
+    if drv is None or not hasattr(drv, "set_deadzone_raw"):
+        print("cynthia: no pot driver with a deadzone control")
         return None
-    n = drv.set_trust_raw(counts)
-    print("cynthia: pot trust_raw = %d counts" % n)
+    n = drv.set_deadzone_raw(counts)
+    print("cynthia: pot deadzone_raw = %d counts" % n)
     return n
 
 
@@ -2117,9 +2119,9 @@ def pot_timing():
     if per_us is not None and rate is not None and per_us / 1000.0 > rate:
         warn = ("  <-- a sweep costs MORE than the scan period, so the poll can"
                 " never idle: fix settle/spi first")
-    rev = drv.reverse_odd() if hasattr(drv, "reverse_odd") else None
+    rev = (drv.reverse_parity() if hasattr(drv, "reverse_parity") else None)
     print("cynthia: settle %sus, spi %s Hz, %.1f ms per sweep, scan every %s ms,"
-          " reverse_odd=%s%s"
+          " reverse=%s%s"
           % (settle, baud, (per_us or 0) / 1000.0, rate, rev, warn))
     return (settle, baud, per_us, rate, rev)
 
