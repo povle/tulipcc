@@ -2080,6 +2080,34 @@ def pot_timing():
     return (settle, baud, per_us, rate)
 
 
+def pot_step(steps=4):
+    """REPL: does one counter pulse move the mux one address?
+
+    The driver's whole address model rests on this. A working board reads
+    ch0 = 8,7,6,5... and ch1 = 1,2,3,4... as k rises, because that is how the
+    two muxes are wired. If the columns do not change with k, the address is not
+    moving - dead CLK path, a latched mux needing a strobe, or a free-running
+    counter - and nothing else the driver reports can be trusted.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "step_probe"):
+        print("cynthia: no pot driver with a step probe")
+        return None
+    rows = drv.step_probe(steps=steps)
+    print("cynthia: k pulses -> (ch0, ch1)   expected ch0 8,7,6,5.. ch1 1,2,3,4..")
+    for k, c0, c1 in rows:
+        print("   k=%d   ch0=%4d  ch1=%4d" % (k, c0, c1))
+    same0 = len(set(r[1] for r in rows)) == 1
+    same1 = len(set(r[2] for r in rows)) == 1
+    if same0 and same1:
+        print("   !! neither channel changed as k rose: the address is NOT moving."
+              " Both are reading the same mux position every time, which makes"
+              " the sensor-to-index map meaningless.")
+    else:
+        print("   ok: the readings move with k, so pulses do step the address")
+    return rows
+
+
 def pot_bench(iters=20):
     """REPL: attribute a slow pot scan to one primitive (microseconds each).
 
@@ -2169,7 +2197,15 @@ def pot_selftest(sweeps=24, stress=40):
                   % (pot, shown, fromraws))
     else:
         print("  values[] match the raws they came from (driver bookkeeping OK)")
-    if r["aliases"]:
+    if r.get("unreadable_pots"):
+        print("  POTS WITH NO VALID PAIR IN ANY SWEEP: %s  (their two wipers"
+              " disagree by 140-175 deg, i.e. the channels are reading"
+              " different sensors - a pot/channel fault, not an address slip;"
+              " they are excluded from the census below)"
+              % ", ".join("P%02d" % p for p in r["unreadable_pots"]))
+    for k, c0, c1 in r.get("steps", ()):
+        print("  step probe k=%d -> ch0=%4d ch1=%4d" % (k, c0, c1))
+    if r.get("aliases"):
         print("  pots currently at the same angle (compare with what is shown): %s"
               % ", ".join("P%02d=P%02d" % a for a in r["aliases"]))
     if r.get("measured_us"):

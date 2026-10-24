@@ -786,6 +786,27 @@ class Driver:
                     out.append((i + 1, j + 1))
         return out
 
+    def step_probe(self, steps=4):
+        """Read both channels after k counter pulses, for k = 0..steps-1.
+
+        The entire driver rests on "one pulse = one address step, and a reset
+        puts us at 0". This checks that directly and assumption-free: for a
+        working counter ch0 walks 8,7,6,5... and ch1 walks 1,2,3,4... as k
+        rises. If the readings do not change with k, the address is not moving
+        (dead CLK path, a latched mux needing a strobe, or a free-running
+        counter), and every conclusion about sensor-to-index mapping is void.
+
+        Returns [(k, ch0_raw, ch1_raw)].
+        """
+        out = []
+        for k in range(int(steps)):
+            self._reset_counter()
+            for _ in range(k):
+                self._pulse_counter()
+            out.append((k, self._read_adc(0), self._read_adc(1)))
+        self._reset_counter()
+        return out
+
     def bench(self, iters=20, cap_us=200000, progress=None):
         """Time the pot path's primitives in microseconds each.
 
@@ -999,10 +1020,16 @@ class Driver:
         clean = 0
         classes = {}
         examples = []
+        # A pot whose pair is rejected in EVERY capture is a hardware fault, and
+        # it must not be allowed to make every sweep look dirty - that is how a
+        # permanently-bad pot turned "0/24 clean" into a false slip verdict.
+        dead = [i + 1 for i in range(NUM_POTS) if ref[i] is None]
+        usable = NUM_POTS - len(dead)
+        out["unreadable_pots"] = dead
         for _ in range(run_sweeps):
             got = self._capture()
             c = self._classify(ref, got, tol)
-            if c["same"] == NUM_POTS:
+            if c["same"] >= usable and c["prev"] == 0 and c["next"] == 0:
                 clean += 1
             else:
                 key = "%d/%d/%d" % (c["prev"], c["next"], c["other"])
@@ -1013,6 +1040,9 @@ class Driver:
                     examples.append(c)
         out["sweeps"] = run_sweeps
         out["clean"] = clean
+
+        say("step probe: does one pulse move one address?")
+        out["steps"] = self.step_probe()
         out["classes"] = classes       # "prev/next/other" -> how many sweeps
         out["examples"] = examples
 
