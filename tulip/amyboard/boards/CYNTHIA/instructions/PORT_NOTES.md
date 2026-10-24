@@ -387,11 +387,27 @@ idf.py -p /dev/cu.usbmodem* -DMICROPY_BOARD=CYNTHIA flash monitor
 3. **Order of #if checks matters**: When multiple board defines are active, the first matching `#if` wins. Put more specific checks (CYNTHIA) before general ones (AMYBOARD).
 
 4. **USB Serial/JTAG requires mp_main_task_handle**: The ISR needs this to wake the main task. Without it, the REPL appears but crashes on any input.
-## Endless pots: the counter misses a step (address slip)
+## Endless pots: the counter gains or loses a step (address slip)
 
-Symptom: a pot's value jumps to **precisely the value of the pot before it**,
-intermittently. That is a one-address slip: the 74HC393 did not take one clock
-edge, so every later address in that sweep is read one behind.
+Symptom: a pot's value jumps to **precisely the value of the previous pot**,
+intermittently. That is a one-address slip somewhere in the sweep: the 74HC393
+took an extra clock edge (or dropped one), so every later address in that sweep
+is read one out.
+
+**Direction is diagnostic, and it is counter-intuitive** (measured with the
+counter/SPI harness, both directions, mid-sweep and at the sweep start):
+
+| fault | what is seen |
+| ----- | ------------ |
+| **extra** count, mid-sweep | pots 10..16 ALL show the **previous** pot's value |
+| **missed** count, mid-sweep | pots 10..16 ALL show the **next** pot's value |
+| either, at the **sweep start** | a **MIXED** pattern: some pots show the previous neighbour, some the next, some unchanged |
+
+So "the value jumped to the previous pot" means an **extra** count, not a missed
+one - the opposite of the intuitive reading. Interpreting it as a missed edge
+sends you chasing the wrong hardware fault. The mixed pattern is the signature
+that separates a start-of-sweep offset (reset/wrap behaviour) from a mid-sweep
+edge (signal integrity on CLK).
 
 Why the existing checks missed it: the pair test compares wiper A of a sensor
 with wiper B of the *same* sensor, and the two muxes are wired in different
@@ -403,37 +419,69 @@ blind to exactly the half where the slip lands as "previous pot's value".
 Fix in `spark_pots_new.py`: addresses 8..15 are re-read after the sweep and
 compared with the first pass (`_verify_upper`). Two passes cannot agree on a
 static pot if the counter slipped between them, because a slip changes every
-read after the missed edge. Failing sweeps are re-read (`SCAN_RETRIES`), and if
-every attempt fails the last sweep is **committed anyway** (`verify_fallbacks()`)
-- refusing to commit would freeze all 16 pots, which is worse than a jump the
-3-sample median absorbs. Instrumentation: `scan_retries()`, `verify_fallbacks()`,
-`verify_sweeps: false` in the driver config, `verify_tol` to widen the tolerance.
+read after the extra or missed edge. Failing sweeps are re-read
+(`SCAN_RETRIES`), and if every attempt fails the last sweep is **committed
+anyway** (`verify_fallbacks()`) - refusing to commit would freeze all 16 pots,
+which is worse than a jump the 3-sample median absorbs. Instrumentation:
+`scan_retries()`, `verify_fallbacks()`, `verify_sweeps: false` in the driver
+config, `verify_tol` to widen the tolerance.
 
-### Why a 74HC393 would fail to advance (hardware, ranked)
+Verified both fault classes against the harness (`/tmp/potsim/t8.py`): an extra
+count in the upper half is committed as a wrong value with verification off, and
+is caught (3 retries, no pot wrong) with it on.
 
-1. **Logic-level mismatch - check VCC first.** HC needs VIH = 0.7xVCC = **3.5V at
-   5V**, and an ESP32-S3 GPIO only drives ~3.2V. If the counter runs on 5V its
-   clock input is never *guaranteed* high: counting becomes marginal and
-   load/temperature dependent, i.e. intermittent. Options: run the counter at
-   3.3V (HC is spec'd 2..6V), or use a **74HCT** (TTL levels, VIH = 2.0V), or
-   level-shift. Scope the CLK pin **at the counter**, not at the MCU.
-2. **No Schmitt trigger on the inputs.** Unlike a 74HC14, the 393 clock input is
-   a plain CMOS gate. A slow or ringing edge on the FFC sits in the linear
-   region and can count twice (shift the *other* way) or not at all. A series
-   resistor slows it further; the correct fix is a Schmitt buffer ahead of CLK.
-3. **Asynchronous MR left floating** or with a weak pull-down - the reset is
-   active high, so a floating line can reset mid-sweep. Note the discriminator: a
-   spurious *reset* restarts the sweep at address 0 (data repeats the **first**
-   pots), while a missed *edge* shifts by one (data looks like the **previous**
-   pot). The reported symptom is the latter, so blame CLK, not MR.
-4. **Decoupling / supply.** 100nF at the counter's VCC pins. NeoPixel writes and
-   audio draw sharp current; a dip on VCC is a missed count.
-5. **Marginal FFC contact on CLK** (the ribbon has already been repaired once).
-6. **Crosstalk from SPI SCK** into CLK in the same FFC - an injected edge
+### The sweep is reset-dependent by design (wraparound audit)
+
+`_read_all_raw()` resets to address 0 and then issues **exactly 15 pulses**, so
+the counter walks 0..15 and **never wraps**: the last pulse is deliberately
+skipped and the counter PARKS at 15 between sweeps. Reaching address 0 in the
+next sweep therefore depends *entirely* on `_reset_counter()`. Nothing in a
+sweep returns the counter to 0 by counting.
+
+Consequences worth knowing:
+
+- A one-shot extra count is only wrong for the rest of *that* sweep; the next
+  reset repairs it. That is why the symptom is intermittent rather than sticky.
+- If the board's ADDR_SHDN **pauses** the counter (tri-states outputs) instead
+  of **clearing** it, every sweep would start at 15, i.e. a *permanent* mixed
+  mis-mapping rather than intermittent jumps. Test: skip one reset and see
+  whether the mapping breaks. If it does not break, the reset is not what puts
+  the counter at 0.
+- The driver never pulses CLK while the reset is asserted - `_reset_counter()`
+  and `_pulse_counter()` are never interleaved, and `start()` sets both low
+  before the first reset. So a "CLK and RST both fired" event at the start of a
+  cycle is **not** driver sequencing; if it exists it is coupling on the board
+  at the reset release (RST and CLK are adjacent in the FFC, and the counter
+  input has no Schmitt trigger), or SHDN is tied to something that clocks.
+
+### Why a 74HC393 would miscount (hardware, ranked)
+
+With the observed direction (previous pot's value) the fault is an **extra
+edge on CLK**, so the ranked suspects are the ones that add counts:
+
+1. **No Schmitt trigger on the inputs.** The 393 clock input is a plain CMOS
+   gate (unlike a 74HC14). A ringing or slow edge on the FFC crosses the
+   threshold more than once and counts twice. A bare series resistor makes the
+   edge *slower*; the correct fix is a Schmitt buffer (74HC14) ahead of CLK, or
+   a damped series R **with** a small cap to ground.
+2. **Crosstalk from SPI SCK** - adjacent in the same FFC, and it runs at 1MHz
+   for the two MCP3002 reads that follow every address change. An injected edge
    double-counts. Test: lower the SPI baud (`set_spi_baud(100000)`) and watch
    whether the slip rate changes.
+3. **Ground/power bounce.** The 16-NeoPixel strip (slot1 pin E) and the I2S DAC
+   draw sharp current; a dip on the counter's VCC is a miscount. 100nF at the
+   counter's VCC pins. Test: `set_led_mode("manual")` to stop the strip
+   updating, or pull it, and see whether the jumps stop.
+4. **Logic-level mismatch.** HC needs VIH = 0.7xVCC = **3.5V at 5V**, and an
+   ESP32-S3 GPIO drives ~3.2V: if the counter runs on 5V its clock input is
+   never *guaranteed* high and counting is marginal/load-dependent. Fix: run the
+   counter at 3.3V (HC is spec'd 2..6V), use a **74HCT** (VIH = 2.0V), or
+   level-shift. Scope CLK **at the counter**, not at the MCU.
+5. **Marginal FFC contact on CLK** (the ribbon has already been repaired once).
+6. **A reset that does not clear** (see the audit above): if ADDR_SHDN only
+   pauses the counter, the offset is permanent, not intermittent.
 
-Note: a *deterministic* slip at the same edge every sweep cannot be distinguished
+A *deterministic* miscount at the same edge every sweep cannot be distinguished
 from a real reading by any comparison - it would show as a permanent
 mis-mapping, not intermittent jumps. Intermittent = detectable, which is what
 `_verify_upper` targets.

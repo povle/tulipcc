@@ -20,12 +20,17 @@
 #   - MCP3002 2-ch 10-bit ADC over hardware SPI (GPIO matrix, §3.1).
 #
 # Slot pin assignments (from angle_test.ino / Board.h, slot 2):
-#   IO_A_2 = counter CLK          -> slot pin A
-#   IO_G_2 = counter RST (high)   -> slot pin G
+#   IO_A_2 = ADDR_CLK             -> slot pin A  (net name on the board)
+#   IO_G_2 = ADDR_SHDN            -> slot pin G  (board's net name; the driver
+#                                   drives it as an active-HIGH reset: idle 0,
+#                                   10us high = address 0)
 #   IO_B_2 = MCP3002 DIN  (MOSI)  -> slot pin B
 #   IO_C_2 = MCP3002 DOUT (MISO)  -> slot pin C
 #   IO_D_2 = MCP3002 CLK  (SCK)   -> slot pin D
 #   IO_F_2 = MCP3002 ~CS          -> slot pin F
+# Slot 1 (0-based) = mainboard DB_2 = GPIO48/47/21/11/12/13/14 for A..G
+# (tulip/amyboard/boards/CYNTHIA/pins.h). Nothing else claims A or G: the pot
+# board's own NeoPixels are on E, and spark_main lives on slot 0.
 #
 # §8 discipline: hardware SPI, pre-allocated buffers, zero allocation in the
 # scan path, paced by the caller (never busy-loop).
@@ -62,13 +67,23 @@ DEADZONE_RAW = 100
 # mis-paired channel shows.
 PAIR_TOL_DEG = 20.0
 
-# A counter that misses a step shifts every later address in that scan, so the
-# data stored for sensor N actually belongs to a neighbour. Because the two
-# muxes are wired in different orders, one shifted address mis-pairs BOTH of the
-# sensors it touches - so a slipped scan shows up as several inconsistent pairs
-# at once, which is a far louder signal than the single-pair noise the per-pot
-# check deals with. Above this many bad pairs the whole scan is treated as
-# address-corrupt and thrown away rather than allowed to poison the values.
+# A counter that gains or loses a step shifts every later address in that scan,
+# so the data stored for sensor N actually belongs to a neighbour. Which way it
+# goes is diagnostic, and the two muxes being wired in different orders is what
+# makes it readable:
+#
+#   extra step, mid-sweep  -> pots 10..16 ALL show the previous pot's value
+#   missed step, mid-sweep -> pots 10..16 ALL show the next pot's value
+#   either, at the SWEEP START -> a MIXED pattern (some pots show the previous
+#                              neighbour, some the next, some unchanged)
+#
+# (Measured, not assumed - see the harness notes in PORT_NOTES.md.)
+# Because the two muxes disagree for addresses 0..7, one shifted address
+# mis-pairs the sensors it touches there, so a slip that starts in the first
+# half shows up as several inconsistent pairs at once - a far louder signal than
+# the single-pair noise the per-pot check deals with. Above this many bad pairs
+# the whole scan is treated as address-corrupt and thrown away rather than
+# allowed to poison the values.
 SHIFT_BAD_PAIRS = 3
 SCAN_RETRIES = 3
 
@@ -402,7 +417,15 @@ class Driver:
             self._update_leds_auto()
 
     def _read_all_raw(self):
-        """One sweep of every address, into _phase0/_phase1. No derived state."""
+        """One sweep of every address, into _phase0/_phase1. No derived state.
+
+        Address contract: reset to 0, then EXACTLY 15 pulses, so the counter
+        walks 0..15 and never wraps - the last pulse is deliberately skipped and
+        the counter PARKS at 15. Reaching address 0 again therefore depends
+        entirely on _reset_counter() at the top of the next sweep; nothing in
+        the sweep itself returns the counter to 0. A stop()/scan() sequence that
+        never re-resets would start the next sweep at 15.
+        """
         self._reset_counter()  # address 0
         for addr in range(NUM_POTS):
             ch1 = self._read_adc(1)
@@ -441,10 +464,10 @@ class Driver:
     def _verify_upper(self):
         """Re-read addresses 8..15 and count how many disagree with pass one.
 
-        A slipped counter changes every read after the missed pulse, so two
-        passes over the same addresses cannot agree while a pot is static. This
-        is the only check that can catch a slip in the half where the two muxes
-        happen to select the same sensor.
+        A slipped counter changes every read after the extra or missed edge, so
+        two passes over the same addresses cannot agree while a pot is static.
+        This is the only check that can catch a slip in the half where the two
+        muxes happen to select the same sensor.
         """
         self._seek(8)
         for addr in range(8, NUM_POTS):
