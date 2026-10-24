@@ -1822,9 +1822,16 @@ _pots_sel = 0            # physical pot under the cursor while editing
 _pots_debug = False
 _pot_dbg_sel = 0
 _pot_dbg_back = None   # screen to return to on exit ("settings" or None)
-# Scan rates the scope can select, slowest last; None stops scanning (which
-# parks the mux for probing).
-_POT_DBG_RATES = (20, 50, 100, 200, 500, 1000, None)
+# Scan settings the scope cycles through: (mode, period_ms).
+#   "all" - visit every mux address (normal operation)
+#   "one" - seek only the selected pot's two addresses, so the mux parks there
+#   None  - stop scanning entirely
+_POT_DBG_RATES = (
+    ("all", 20), ("all", 50), ("all", 100), ("all", 200), ("all", 500),
+    ("all", 1000),
+    ("one", 20), ("one", 50), ("one", 100), ("one", 200),
+    (None, None),
+)
 _pot_dbg_rate = 0
 
 
@@ -1850,13 +1857,7 @@ def open_pot_debug(pot=0, back=None):
     _pots_debug = True
     _pot_dbg_sel = max(0, min(15, int(pot)))
     _joy_reset()
-    drv = _pot_driver()
-    if drv is not None and hasattr(drv, "scan_period"):
-        cur = drv.scan_period()
-        try:
-            _set_pot_dbg_rate(_POT_DBG_RATES.index(cur))
-        except ValueError:
-            _set_pot_dbg_rate(0)
+    _sync_pot_dbg_rate()
     print("cynthia: pot scope P%02d — stick up/down = pot, left/right = scan rate"
           % (_pot_dbg_sel + 1))
     _draw_ui(force=True)
@@ -1868,8 +1869,11 @@ def close_pot_debug():
     # Leaving the scope restores normal pacing: a pot board left frozen would
     # look like dead knobs everywhere else in the UI.
     drv = _pot_driver()
-    if drv is not None and hasattr(drv, "set_scan_period"):
-        drv.set_scan_period(20)
+    if drv is not None:
+        if hasattr(drv, "set_single_pot"):
+            drv.set_single_pot(None)
+        if hasattr(drv, "set_scan_period"):
+            drv.set_scan_period(20)
     _joy_reset()
     back = _pot_dbg_back
     _pot_dbg_back = None
@@ -1929,8 +1933,7 @@ def _draw_pot_debug(disp):
     title = "P%02d ADC" % (_pot_dbg_sel + 1)
     disp.draw_str(display.FONT_5X7, 2, 8, title, 1)
     # Scan state on the right of the title: what the mux is actually doing.
-    rate = _POT_DBG_RATES[_pot_dbg_rate]
-    rtxt = "OFF" if rate is None else ("%dms" % rate)
+    rtxt = _pot_dbg_label()
     disp.draw_str(display.FONT_5X7, 126 - disp.str_width(display.FONT_5X7, rtxt),
                   8, rtxt, 1)
     disp.hline(0, 10, 128, 1)
@@ -1959,7 +1962,7 @@ def _draw_pot_debug(disp):
         "pos %6.1f" % ang,
         "err %+5.0f rej %d" % (err, perr),
     ]
-    if rate is None:
+    if _POT_DBG_RATES[_pot_dbg_rate][1] is None:
         lines[-1] = "click=1 scan"
     y = 34
     for ln in lines:
@@ -1967,29 +1970,68 @@ def _draw_pot_debug(disp):
         y += 8
 
 
+def _apply_pot_dbg_rate():
+    """Push the selected (mode, period) into the driver."""
+    mode, period = _POT_DBG_RATES[_pot_dbg_rate]
+    drv = _pot_driver()
+    if drv is None:
+        return
+    if hasattr(drv, "set_single_pot"):
+        drv.set_single_pot(_pot_dbg_sel if mode == "one" else None)
+    if hasattr(drv, "set_scan_period"):
+        drv.set_scan_period(period)
+    return mode, period
+
+
 def _set_pot_dbg_rate(idx):
-    """Select a scan rate (index into _POT_DBG_RATES) and apply it."""
+    """Select a scan setting (index into _POT_DBG_RATES) and apply it."""
     global _pot_dbg_rate
     if idx < 0:
         idx = 0
     elif idx >= len(_POT_DBG_RATES):
         idx = len(_POT_DBG_RATES) - 1
     _pot_dbg_rate = idx
+    return _apply_pot_dbg_rate()
+
+
+def _sync_pot_dbg_rate():
+    """Point the selector at whatever the driver is currently doing."""
+    global _pot_dbg_rate
     drv = _pot_driver()
-    if drv is not None and hasattr(drv, "set_scan_period"):
-        drv.set_scan_period(_POT_DBG_RATES[idx])
-    return _POT_DBG_RATES[idx]
+    if drv is None or not hasattr(drv, "scan_period"):
+        return
+    cur = drv.scan_period()
+    mode = "one" if getattr(drv, "single_pot", lambda: None)() is not None else "all"
+    if cur is None:
+        _pot_dbg_rate = len(_POT_DBG_RATES) - 1
+        return
+    for i, (m, p) in enumerate(_POT_DBG_RATES):
+        if p == cur and m == mode:
+            _pot_dbg_rate = i
+            return
 
 
-def set_pot_scan_rate(ms):
-    """REPL: scan every `ms` milliseconds, or None to stop the mux."""
+def _pot_dbg_label():
+    mode, period = _POT_DBG_RATES[_pot_dbg_rate]
+    if period is None:
+        return "OFF"
+    return ("1P %dms" % period) if mode == "one" else ("%dms" % period)
+
+
+def set_pot_scan_rate(ms, single=None):
+    """REPL: scan every `ms` ms, or None to stop. `single` picks the pot to
+    poll exclusively (None = every address)."""
+    global _pot_dbg_sel
+    if single is not None:
+        _pot_dbg_sel = max(0, min(15, int(single)))
+    mode = "all" if single is None else "one"
     if ms is None:
         return _set_pot_dbg_rate(len(_POT_DBG_RATES) - 1)
-    try:
-        return _set_pot_dbg_rate(_POT_DBG_RATES.index(int(ms)))
-    except ValueError:
-        print("cynthia: rate must be one of", _POT_DBG_RATES)
-        return None
+    for i, (m, p) in enumerate(_POT_DBG_RATES):
+        if p == int(ms) and m == mode:
+            return _set_pot_dbg_rate(i)
+    print("cynthia: (ms, single) must match one of", _POT_DBG_RATES)
+    return None
 
 
 def pot_scan_rate():
@@ -2014,6 +2056,8 @@ def _handle_joystick_pot_debug(jx, jy):
             new = 15
         if new != _pot_dbg_sel:
             _pot_dbg_sel = new
+            if _POT_DBG_RATES[_pot_dbg_rate][0] == "one":
+                _apply_pot_dbg_rate()
             _draw_ui(force=True)
 
 

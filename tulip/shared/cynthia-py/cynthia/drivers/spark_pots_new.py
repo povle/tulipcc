@@ -127,6 +127,12 @@ def _ticks_diff(a, b):
 MUX0_MAP = (8, 7, 6, 5, 4, 3, 2, 1, 16, 15, 14, 13, 12, 11, 10, 9)
 MUX1_MAP = (1, 2, 3, 4, 5, 6, 7, 8, 16, 15, 14, 13, 12, 11, 10, 9)
 
+# Counter address that selects each sensor (1-based) on each mux. A pot's two
+# wipers live at DIFFERENT addresses because the muxes are wired in different
+# orders, which is why single-pot mode has to seek twice.
+_ADDR0 = tuple(MUX0_MAP.index(s) for s in range(1, NUM_POTS + 1))
+_ADDR1 = tuple(MUX1_MAP.index(s) for s in range(1, NUM_POTS + 1))
+
 # MCP3002 control bytes: single-ended, MSB first.
 _CMD_CH0 = 0x68
 _CMD_CH1 = 0x78
@@ -181,6 +187,8 @@ class Driver:
         # meter while it is not being switched.
         self._scan_period_ms = SCAN_PERIOD_MS
         self._scan_saved_ms = SCAN_PERIOD_MS
+        # None = visit every address; an index = only poll that pot.
+        self._single_pot = None
         # NeoPixels (optional, §10.2) — only if configured.
         self._leds = None
         self._led_mode = "auto"
@@ -273,6 +281,21 @@ class Driver:
         self._clk.value(0)
         time.sleep_us(self._mux_settle_us)
 
+    def _seek(self, addr):
+        """Reset the counter and step to `addr`, settling only at the target.
+
+        Passing THROUGH addresses costs nothing electrically (nothing reads
+        them), so intermediate steps skip the settle and the caller settles
+        once before reading. That is what makes single-pot polling cheap.
+        """
+        self._reset_counter()
+        for _ in range(addr):
+            self._clk.value(1)
+            time.sleep_us(10)
+            self._clk.value(0)
+            time.sleep_us(10)
+        time.sleep_us(self._mux_settle_us)
+
     # --- angle math (ported from computeAngle) ---
 
     def _compute_angle(self, raw0, raw1):
@@ -329,10 +352,19 @@ class Driver:
     # --- scan ---
 
     def scan(self):
-        """One full 16-address scan; updates self.values (0..1 per pot).
+        """One scan: either every address, or just the selected pot.
 
-        Call at a paced rate (§8). Takes a few ms (32 SPI reads + settles).
+        Call at a paced rate (§8). Full mode is 32 SPI reads + settles (~3.4ms);
+        single-pot mode touches only that pot's two addresses.
         """
+        if self._single_pot is None:
+            self._scan_all()
+        else:
+            self._scan_one(self._single_pot)
+        if self._leds and self._led_mode == "auto":
+            self._update_leds_auto()
+
+    def _scan_all(self):
         self._reset_counter()  # address 0
         for addr in range(NUM_POTS):
             ch1 = self._read_adc(1)
@@ -342,83 +374,97 @@ class Driver:
             if addr < NUM_POTS - 1:
                 self._pulse_counter()
         for i in range(NUM_POTS):
-            r0 = self._phase0[i]
-            r1 = self._phase1[i]
-            m0 = _median3(self._r0p2[i], self._r0p1[i], r0)
-            m1 = _median3(self._r1p2[i], self._r1p1[i], r1)
-            self._r0p2[i] = self._r0p1[i]
-            self._r0p1[i] = r0
-            self._r1p2[i] = self._r1p1[i]
-            self._r1p1[i] = r1
+            self._update_pot(i)
 
-            ang = self._compute_angle(m0, m1)
-            resync = False
-            if ang is None:
-                # Pair rejected: hold the last good angle so the knob does not
-                # jump, and count it. A climbing count for one pot is a hardware
-                # fault report, not noise.
-                self._pair_err[i] += 1
+    def _scan_one(self, n):
+        """Poll a single pot: seek to each of its two addresses and read it.
+
+        The mux only ever visits those two positions, so a probe on that
+        channel sees a stable selection instead of a 50Hz sweep. Other pots keep
+        their last values.
+        """
+        self._seek(_ADDR0[n])
+        self._phase0[n] = self._read_adc(0)
+        self._seek(_ADDR1[n])
+        self._phase1[n] = self._read_adc(1)
+        self._update_pot(n)
+
+    def _update_pot(self, i):
+        r0 = self._phase0[i]
+        r1 = self._phase1[i]
+        m0 = _median3(self._r0p2[i], self._r0p1[i], r0)
+        m1 = _median3(self._r1p2[i], self._r1p1[i], r1)
+        self._r0p2[i] = self._r0p1[i]
+        self._r0p1[i] = r0
+        self._r1p2[i] = self._r1p1[i]
+        self._r1p1[i] = r1
+
+        ang = self._compute_angle(m0, m1)
+        resync = False
+        if ang is None:
+            # Pair rejected: hold the last good angle so the knob does not
+            # jump, and count it. A climbing count for one pot is a hardware
+            # fault report, not noise.
+            self._pair_err[i] += 1
+            self._stale[i] = True
+            ang = self.values[i] * 360.0
+        elif self._stale[i]:
+            # RECOVERING from a bad stretch. Do not treat the catch-up as a
+            # glitch: holding here left the anchor behind, so every later
+            # sample also looked like a jump and the pot stayed stuck while
+            # the real value moved on (the "wiper stops tracking" symptom).
+            # Re-seed instead, and emit no delta for the jump.
+            self._stale[i] = False
+            resync = True
+            self._used0[i] = m0
+            self._used1[i] = m1
+        elif self._anchor[i] is not None:
+            # Temporal plausibility: nothing a hand can do moves 90 deg in
+            # one 20ms scan.
+            dd = ang - self.values[i] * 360.0
+            if dd > 180.0:
+                dd -= 360.0
+            elif dd < -180.0:
+                dd += 360.0
+            if dd >= GLITCH_DEG or dd <= -GLITCH_DEG:
+                self._glitches += 1
                 self._stale[i] = True
                 ang = self.values[i] * 360.0
-            elif self._stale[i]:
-                # RECOVERING from a bad stretch. Do not treat the catch-up as a
-                # glitch: holding here left the anchor behind, so every later
-                # sample also looked like a jump and the pot stayed stuck while
-                # the real value moved on (the "wiper stops tracking" symptom).
-                # Re-seed instead, and emit no delta for the jump.
-                self._stale[i] = False
-                resync = True
-                self._used0[i] = m0
-                self._used1[i] = m1
-            elif self._anchor[i] is not None:
-                # Temporal plausibility: nothing a hand can do moves 90 deg in
-                # one 20ms scan.
-                dd = ang - self.values[i] * 360.0
-                if dd > 180.0:
-                    dd -= 360.0
-                elif dd < -180.0:
-                    dd += 360.0
-                if dd >= GLITCH_DEG or dd <= -GLITCH_DEG:
-                    self._glitches += 1
-                    self._stale[i] = True
-                    ang = self.values[i] * 360.0
-                else:
-                    self._used0[i] = m0
-                    self._used1[i] = m1
             else:
                 self._used0[i] = m0
                 self._used1[i] = m1
+        else:
+            self._used0[i] = m0
+            self._used1[i] = m1
 
-            self.values[i] = ang / 360.0
+        self.values[i] = ang / 360.0
 
-            if resync:
-                # Position jumped while the sensor was bad: take the new angle
-                # as the reference but do NOT turn it into parameter movement.
-                self._anchor[i] = ang
-                continue
+        if resync:
+            # Position jumped while the sensor was bad: take the new angle
+            # as the reference but do NOT turn it into parameter movement.
+            self._anchor[i] = ang
+            return
 
-            anchor = self._anchor[i]
-            if anchor is None:
-                self._anchor[i] = ang
-                continue
-            d = ang - anchor
-            if d > 180.0:
-                d -= 360.0
-            elif d < -180.0:
-                d += 360.0
-            if d >= self._deadband or d <= -self._deadband:
-                turns = d / 360.0
-                # Odd-indexed pots sit on the back of the board, so their
-                # rotation is mechanically inverted. Flip the DELTA rather than
-                # the angle: the angle stays the physical position (what the
-                # scope and the pair checks reason about).
-                if self._reverse_odd and (i & 1):
-                    turns = -turns
-                self._delta[i] += turns
-                self._has_delta = True
-                self._anchor[i] = ang
-        if self._leds and self._led_mode == "auto":
-            self._update_leds_auto()
+        anchor = self._anchor[i]
+        if anchor is None:
+            self._anchor[i] = ang
+            return
+        d = ang - anchor
+        if d > 180.0:
+            d -= 360.0
+        elif d < -180.0:
+            d += 360.0
+        if d >= self._deadband or d <= -self._deadband:
+            turns = d / 360.0
+            # Odd-indexed pots sit on the back of the board, so their
+            # rotation is mechanically inverted. Flip the DELTA rather than
+            # the angle: the angle stays the physical position (what the
+            # scope and the pair checks reason about).
+            if self._reverse_odd and (i & 1):
+                turns = -turns
+            self._delta[i] += turns
+            self._has_delta = True
+            self._anchor[i] = ang
 
     def poll(self, now_ms=None):
         """Scan at a PACED rate, not on every call.
@@ -445,6 +491,24 @@ class Driver:
     def knobs(self):
         """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
         return self.values
+
+    def set_single_pot(self, pot):
+        """Poll only `pot` (0-based), or None to scan every address.
+
+        In single-pot mode the mux only ever seeks that pot's two addresses, so
+        a probe on its channel sees a stable selection instead of a 50Hz sweep.
+        """
+        if pot is None:
+            self._single_pot = None
+        else:
+            pot = int(pot)
+            if pot < 0 or pot >= NUM_POTS:
+                pot = 0
+            self._single_pot = pot
+        return self._single_pot
+
+    def single_pot(self):
+        return self._single_pot
 
     def set_scan_period(self, ms):
         """Scan every `ms` milliseconds, or None to stop scanning entirely.

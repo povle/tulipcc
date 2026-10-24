@@ -449,11 +449,20 @@ Driver notes worth keeping:
   rt.pot_debug(0)          # on-screen scope for one pot (also Settings >
                            # Pots debug, which returns there on exit)
   ```
-  The scope does NOT narrow the scan: the mux keeps cycling all 16 addresses at
-  the current rate, and the screen only displays one pot's slice. Left/right on
-  the stick changes the scan rate live (20/50/100/200/500/1000 ms, then OFF);
-  the rate is shown top-right and OFF parks the counter so a channel can be
-  probed with a meter while it is not being switched. With the scan stopped, a
+  Left/right on the stick cycles the scan setting live, and the label top-right
+  says which: `20ms`..`1000ms` visit **every** mux address, `1P 20ms`..`1P 200ms`
+  poll **only the selected pot**, and `OFF` stops scanning entirely. In
+  single-pot mode the mux seeks just that pot's two addresses
+  (`_ADDR0[n]`/`_ADDR1[n]` — they differ because the two muxes are wired in
+  different orders), so it parks on those two positions instead of sweeping all
+  16; other pots keep their last values. Measured: 2 ADC reads per scan versus
+  32. Changing the selected pot re-seeks immediately.
+
+  The rate alone does NOT narrow the scan — `20ms` means the mux still cycles
+  all 16 addresses at the current rate and the screen only displays one pot's
+  slice. `OFF` parks the counter;
+  so a channel can be probed with a meter while it is not being switched. With
+  the scan stopped, a
   click performs one scan instead of leaving the screen (the bottom line says
   `click=1 scan`); leaving the scope always restores 20 ms so the knobs are not
   left frozen. `rt.set_pot_scan_rate(ms|None)` and `rt.pot_scan_rate()` do the
