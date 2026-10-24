@@ -468,6 +468,23 @@ Driver notes worth keeping:
   left frozen. `rt.set_pot_scan_rate(ms|None)` and `rt.pot_scan_rate()` do the
   same from the REPL. Note `rt.trace_pot()` scans directly on top of the poll,
   so its rejection counts climb faster than the steady-state rate.
+  **Settling readout.** The dummy conversion that used to be discarded is now
+  kept, and the scope prints `d0/d1` = how far the reading moved between two
+  conversions 20us apart. Near zero means the node is settled and the ADC/pot
+  are quiet; tens of counts means it is still settling (charge injection from
+  the mux address change) or noisy. The patch buttons cycle the mux settle time
+  (0/50/100/200/500/1000us) live and toast the new value; `rt.set_pot_settle(us)`
+  does the same from the REPL. This is how to tell "not enough settling" from
+  "a bad channel": if raising the settle collapses `d0/d1` and the drift, it was
+  settling; if it does not, suspect a floating/high-impedance channel elsewhere
+  in the sweep, which injects charge into the shared mux node and disturbs the
+  NEXT address's read.
+  **Single-pot mode is the stable one.** Measured on the sample board: in `1P`
+  the readings are steady, in full-sweep mode they drift about +-10 counts and
+  occasionally jump ~50. Since 1P differs only in WHICH addresses are read, the
+  disturbance is introduced by visiting the other addresses, not by the pot or
+  the ADC. Walk the pots in `1P` to find channels whose raw is stuck near a
+  rail, then look at those joints.
   The scope draws both raw wiper channels as bars (filtered values, with the
   raw counts printed under them), ticks at the raw count the second wiper
   should have (that 180-degree offset, +/- the tolerance band), plus the

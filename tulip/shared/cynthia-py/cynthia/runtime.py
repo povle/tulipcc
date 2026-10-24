@@ -137,6 +137,9 @@ def pots_report():
     if hasattr(drv, "timing"):
         baud, settle = drv.timing()
         print("spi: %d Hz   mux settle: %d us" % (baud, settle))
+    if hasattr(drv, "single_pot"):
+        sp = drv.single_pot()
+        print("mode: %s" % ("single pot P%02d" % (sp + 1) if sp is not None else "all addresses"))
     if hasattr(drv, "glitch_count"):
         print("glitches: %d" % drv.glitch_count())
 
@@ -1344,9 +1347,16 @@ def _handle_event(ev):
                     _draw_ui(force=True)
                 else:
                     close_pot_debug()
+            elif kind == "short_press" and idx in (BTN_PATCH_PREV, BTN_PATCH_NEXT):
+                # Patch buttons tune the mux settle time; the stick already owns
+                # pot selection and scan rate.
+                _cycle_pot_settle()
+                _draw_ui(force=True)
             elif kind == "short_press":
-                step = -1 if idx in (BTN_OCTAVE_DOWN, BTN_PATCH_PREV) else 1
+                step = -1 if idx == BTN_OCTAVE_DOWN else 1
                 _pot_dbg_sel = max(0, min(15, _pot_dbg_sel + step))
+                if _POT_DBG_RATES[_pot_dbg_rate][0] == "one":
+                    _apply_pot_dbg_rate()
                 _draw_ui(force=True)
             return
         if _local_active:
@@ -1956,9 +1966,12 @@ def _draw_pot_debug(disp):
         err -= 1083.0
     elif err < -511.5:
         err += 1083.0
+    sd0, sd1 = drv.settle_delta(_pot_dbg_sel) if hasattr(drv, "settle_delta") else (0, 0)
     lines = [
         "exp %4d" % exp,
-        "raw %4d/%4d" % (r0, r1),
+        # d0/d1: how far the reading moved between two conversions 20us apart.
+        # Near zero means the node is settled; tens of counts means it is not.
+        "raw %4d/%4d d%+d/%+d" % (r0, r1, sd0, sd1),
         "pos %6.1f" % ang,
         "err %+5.0f rej %d" % (err, perr),
     ]
@@ -2016,6 +2029,40 @@ def _pot_dbg_label():
     if period is None:
         return "OFF"
     return ("1P %dms" % period) if mode == "one" else ("%dms" % period)
+
+
+_POT_SETTLES = (0, 50, 100, 200, 500, 1000)
+
+
+def set_pot_settle(us):
+    """REPL: mux settle time in microseconds (bigger = more settling time)."""
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_mux_settle"):
+        print("cynthia: no pot board with a settle control")
+        return None
+    us = drv.set_mux_settle(us)
+    print("cynthia: mux settle = %d us" % us)
+    return us
+
+
+def pot_settle():
+    drv = _pot_driver()
+    return drv.mux_settle() if drv is not None and hasattr(drv, "mux_settle") else None
+
+
+def _cycle_pot_settle():
+    """Step the mux settle time and say so (no room for it on the screen)."""
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_mux_settle"):
+        return
+    cur = drv.mux_settle()
+    try:
+        i = _POT_SETTLES.index(cur)
+    except ValueError:
+        i = 2
+    nxt = _POT_SETTLES[(i + 1) % len(_POT_SETTLES)]
+    drv.set_mux_settle(nxt)
+    toast("settle %dus" % nxt, 900)
 
 
 def set_pot_scan_rate(ms, single=None):

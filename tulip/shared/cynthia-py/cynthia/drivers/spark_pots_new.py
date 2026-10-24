@@ -151,6 +151,13 @@ class Driver:
         self._phase1 = [0] * NUM_POTS
         self._tx = bytearray(2)
         self._rx = bytearray(2)
+        self._drx = bytearray(2)
+        # |real - dummy| of the last conversion: how much the reading moves
+        # between two samples taken 20us apart. Large values mean the node is
+        # still settling (or is noisy); zero means the ADC/pot are quiet.
+        self._last_delta = 0
+        self._sd0 = [0] * NUM_POTS
+        self._sd1 = [0] * NUM_POTS
         # Knob values 0..1 (angle / 360), exposed via knobs().
         self.values = [0.0] * NUM_POTS
         # Rotation accumulation for relative mode (see DELTA_DEADBAND_DEG).
@@ -254,9 +261,11 @@ class Driver:
         cmd = _CMD_CH0 if channel == 0 else _CMD_CH1
         self._tx[0] = cmd
         self._tx[1] = 0x00
-        # Dummy transaction to clear internal state and settle the mux.
+        # Dummy transaction to clear internal state and settle the mux. Its
+        # result is kept, not discarded: the difference between it and the real
+        # conversion is a direct measurement of residual settling.
         self._cs.value(0)
-        self._spi.write(self._tx)
+        self._spi.write_readinto(self._tx, self._drx)
         self._cs.value(1)
         time.sleep_us(ADC_SETTLE_US)
         # Real transaction.
@@ -264,7 +273,10 @@ class Driver:
         self._spi.write_readinto(self._tx, self._rx)
         self._cs.value(1)
         # b0 contains 6 leading zeros + B9, B8; b1 contains B7..B0.
-        return ((self._rx[0] & 0x03) << 8) | self._rx[1]
+        dummy = ((self._drx[0] & 0x03) << 8) | self._drx[1]
+        real = ((self._rx[0] & 0x03) << 8) | self._rx[1]
+        self._last_delta = real - dummy
+        return real
 
     # --- 74HC393D counter ---
 
@@ -370,7 +382,9 @@ class Driver:
             ch1 = self._read_adc(1)
             ch0 = self._read_adc(0)
             self._phase0[MUX0_MAP[addr] - 1] = ch0
+            self._sd0[MUX0_MAP[addr] - 1] = self._last_delta
             self._phase1[MUX1_MAP[addr] - 1] = ch1
+            self._sd1[MUX1_MAP[addr] - 1] = self._last_delta
             if addr < NUM_POTS - 1:
                 self._pulse_counter()
         for i in range(NUM_POTS):
@@ -385,8 +399,10 @@ class Driver:
         """
         self._seek(_ADDR0[n])
         self._phase0[n] = self._read_adc(0)
+        self._sd0[n] = self._last_delta
         self._seek(_ADDR1[n])
         self._phase1[n] = self._read_adc(1)
+        self._sd1[n] = self._last_delta
         self._update_pot(n)
 
     def _update_pot(self, i):
@@ -491,6 +507,21 @@ class Driver:
     def knobs(self):
         """16 knob positions 0..1 (absolute angle / 360), for the knob map."""
         return self.values
+
+    def settle_delta(self, pot):
+        """(d0, d1) = |real - dummy| of the last conversion of each wiper."""
+        return (self._sd0[pot], self._sd1[pot])
+
+    def set_mux_settle(self, us):
+        """Settle time after a mux address change, live (diagnostic)."""
+        us = int(us)
+        if us < 0:
+            us = 0
+        self._mux_settle_us = us
+        return us
+
+    def mux_settle(self):
+        return self._mux_settle_us
 
     def set_single_pot(self, pot):
         """Poll only `pot` (0-based), or None to scan every address.
