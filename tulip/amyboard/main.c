@@ -47,6 +47,7 @@
 #include "py/repl.h"
 #include "py/gc.h"
 #include "py/mphal.h"
+#include "py/mpprint.h"
 #include "shared/readline/readline.h"
 #include "shared/runtime/pyexec.h"
 #include "uart.h"
@@ -136,11 +137,11 @@ float compute_cpu_usage(uint8_t debug) {
     pxTaskStatusArray = pvPortMalloc( uxArraySize * sizeof( TaskStatus_t ) );
     uxArraySize = uxTaskGetSystemState( pxTaskStatusArray, uxArraySize, NULL );
     if(debug) {
-        printf("%d tasks running now\n", uxArraySize);
+        mp_printf(&mp_plat_print, "%d tasks running now\n", uxArraySize);
         for(x=0; x<uxArraySize; x++) { // for each task
-            printf("_%s_ ", pxTaskStatusArray[x].pcTaskName);
+            mp_printf(&mp_plat_print, "_%s_ ", pxTaskStatusArray[x].pcTaskName);
         }
-        printf("\n");
+        mp_printf(&mp_plat_print, "\n");
     }
     
     unsigned long counter_since_last[MAX_TASKS];
@@ -161,10 +162,10 @@ float compute_cpu_usage(uint8_t debug) {
         }
     }
     if(debug) {
-        printf("------ CPU usage since last call to tulip.cpu()\n");
+        mp_printf(&mp_plat_print, "------ CPU usage since last call to tulip.cpu()\n");
         for(i=0;i<MAX_TASKS;i++) {
             if(tasks[i] == 0) break;
-            printf("%d %-15s\t%-15ld\t\t%2.2f%%\n", cores[i], tasks[i], counter_since_last[i], ((float)counter_since_last[i])/ulTotalRunTime_per_core[cores[i]] * 100.0);
+            mp_printf(&mp_plat_print, "%d %-15s\t%-15ld\t\t%2.2f%%\n", cores[i], tasks[i], counter_since_last[i], ((float)counter_since_last[i])/ulTotalRunTime_per_core[cores[i]] * 100.0);
         }
     }
     vPortFree(pxTaskStatusArray);
