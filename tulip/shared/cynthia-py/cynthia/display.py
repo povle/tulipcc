@@ -7,6 +7,7 @@
 # The original Arduino firmware uses U8G2_SH1106_128X64_NONAME_F_HW_I2C
 # with rotation U8G2_R2 (180°). We replicate that here.
 
+import time
 import framebuf
 from machine import I2C, Pin
 from . import pins, i18n
@@ -63,9 +64,15 @@ class SH1106:
         if i2c is None:
             i2c = I2C(0, scl=Pin(pins.I2C_SCL), sda=Pin(pins.I2C_SDA), freq=400000)
         self.i2c = i2c
+        self._write_cmd(0x20, 0x00)    # horizontal addressing mode (for 0x21/0x22)
         # Shadow of what the panel is actually showing, so show() can skip pages
         # that did not change. None until the first frame.
         self._shadow = None
+        # Flush accounting, so a profiler can say whether the dirty-page test is
+        # doing anything and what the I2C flush really costs.
+        self.pages_total = 0
+        self.show_calls = 0
+        self.show_us_total = 0
 
         # Framebuffer: MONO_VLSB is the native SH1106 format
         self.buffer = bytearray(WIDTH * HEIGHT // 8)
@@ -104,17 +111,21 @@ class SH1106:
     def show(self, force=False):
         """Push the framebuffer to the display, page by page.
 
-        A full 128x64 frame is 1024 bytes, which is ~23ms of I2C wire time at
-        400kHz - that alone caps the screen near 40fps however fast the UI is.
-        Almost every frame differs in only a few pages (a knob value, one
-        slider), so this keeps a shadow copy of what the panel is showing and
-        sends only the pages that actually changed. Each page goes out with
-        writevto so no 129-byte buffer is allocated per page (that copy was 8
-        allocations per frame).
+        A full 128x64 frame is 1024 bytes, ~23ms of I2C wire time at 400kHz -
+        that alone caps the screen near 40fps however fast the UI is. Almost
+        every frame differs in only a few pages (a knob value, one slider), so
+        this keeps a shadow copy of what the panel is showing and sends only the
+        pages that changed.
 
-        force=True repaints everything (use after anything that could have
-        left the panel's RAM out of step, e.g. a reset).
+        All 8 pages changing is the common case when the UI clears and redraws
+        the whole screen, so when that happens the frame goes out as ONE command
+        transaction (horizontal addressing window for the 8 pages) plus ONE data
+        transaction, instead of 16 transactions of 8 pages.
+
+        force=True repaints everything (after anything that could have left the
+        panel's RAM out of step, e.g. a reset).
         """
+        t0 = time.ticks_us()
         buf = self.buffer
         sh = self._shadow
         if force or sh is None:
@@ -123,19 +134,33 @@ class SH1106:
             pages = [p for p in range(8)
                      if buf[p * WIDTH:(p + 1) * WIDTH] != sh[p * WIDTH:(p + 1) * WIDTH]]
             if not pages:
+                self.show_calls += 1
+                self.show_us_total += time.ticks_diff(time.ticks_us(), t0)
                 return
-        for page in pages:
-            self._write_cmd(
-                0xB0 | page,  # Set page address
-                0x00 | (_COL_OFFSET & 0x0F),  # Lower column address
-                0x10 | ((_COL_OFFSET >> 4) & 0x0F),  # Upper column address
-            )
-            o = page * WIDTH
+        if len(pages) == 8:
+            # Whole frame: set the window once, then one data stream.
+            self._write_cmd(0x21, _COL_OFFSET, _COL_OFFSET + WIDTH - 1)  # columns
+            self._write_cmd(0x22, 0, 7)                                  # pages
             try:
-                self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[o:o + WIDTH]))
+                self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[:]))
             except (AttributeError, TypeError):
-                # writevto is not everywhere (e.g. some ports); keep the copy.
-                self.i2c.writeto(self.addr, bytes([_DATA]) + buf[o:o + WIDTH])
+                self.i2c.writeto(self.addr, bytes([_DATA]) + buf[:])
+            self.pages_total += 8
+        else:
+            for page in pages:
+                self._write_cmd(
+                    0xB0 | page,  # Set page address
+                    0x00 | (_COL_OFFSET & 0x0F),  # Lower column address
+                    0x10 | ((_COL_OFFSET >> 4) & 0x0F),  # Upper column address
+                )
+                o = page * WIDTH
+                try:
+                    self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[o:o + WIDTH]))
+                except (AttributeError, TypeError):
+                    self.i2c.writeto(self.addr, bytes([_DATA]) + buf[o:o + WIDTH])
+            self.pages_total += len(pages)
+        self.show_calls += 1
+        self.show_us_total += time.ticks_diff(time.ticks_us(), t0)
         if sh is None:
             self._shadow = bytearray(buf)
         else:

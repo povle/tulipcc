@@ -1076,6 +1076,15 @@ def _prof_add(name, t0):
         e[1] += 1
 
 
+def _prof_add_val(name, v):
+    e = _prof.get(name)
+    if e is None:
+        _prof[name] = [v, 1]
+    else:
+        e[0] += v
+        e[1] += 1
+
+
 def poll_profile(on=None):
     """REPL: where one UI poll spends its time, and how often it paints.
 
@@ -1103,9 +1112,13 @@ def poll_profile(on=None):
     rate = tot_n / secs if secs else 0.0
     print("cynthia: %d polls in %.1fs = %.1f Hz, %.2f ms each"
           % (tot_n, secs, rate, tot_us / tot_n / 1000.0))
-    for k in ("input", "draw+paint", "total"):
+    for k in ("input", "draw+paint", "flush", "pages", "total"):
         e = _prof.get(k)
-        if e:
+        if not e:
+            continue
+        if k == "pages":
+            print("  %-11s %7.1f pages avg  %4d paints" % (k, e[0] / e[1], e[1]))
+        else:
             print("  %-11s %7.2f ms avg  %4d times  %6.1f/s"
                   % (k, e[0] / e[1] / 1000.0, e[1], e[1] / secs if secs else 0.0))
     out = {k: v[0] / v[1] for k, v in _prof.items()}
@@ -1254,8 +1267,14 @@ def _poll_body(tick):
     if _dirty or (_REFRESH_MS and time.ticks_diff(now, _last_paint_ms) >= _REFRESH_MS):
         if _PROFILE:
             t0 = time.ticks_us()
+            _d = surface.display()
+            _p0 = _d.pages_total if _d is not None else 0
+            _s0 = _d.show_us_total if _d is not None else 0
             _draw_ui()
             _prof_add("draw+paint", t0)
+            if _d is not None:
+                _prof_add_val("flush", _d.show_us_total - _s0)
+                _prof_add_val("pages", _d.pages_total - _p0)
         else:
             _draw_ui()
     if _PROFILE:
