@@ -2093,12 +2093,14 @@ def pot_bench(iters=20):
     if drv is None or not hasattr(drv, "bench"):
         print("cynthia: no pot driver with a bench")
         return None
-    rows = drv.bench(iters=iters)
-    print("cynthia: pot primitive timing (microseconds each):")
+    print("cynthia: pot primitive timing (microseconds each), streaming:")
+    def _row(label, us, n):
+        print("  %-14s %9.1f us   (%d iters)" % (label, us, n))
+
+    rows = drv.bench(iters=iters, progress=_row)
     seen = {}
     for label, us, n in rows:
         seen[label] = us
-        print("  %-14s %9.1f us   (%d iters)" % (label, us, n))
     implied = 16 * (2 * seen.get("adc read", 0) + seen.get("counter pulse", 0))
     print("  -> a sweep costs %.1f ms by measurement, vs %.1f ms modelled"
           % (implied / 1000.0, drv.sweep_us() / 1000.0))

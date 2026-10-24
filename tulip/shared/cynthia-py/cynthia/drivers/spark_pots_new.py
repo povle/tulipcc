@@ -786,7 +786,7 @@ class Driver:
                     out.append((i + 1, j + 1))
         return out
 
-    def bench(self, iters=20, cap_us=200000):
+    def bench(self, iters=20, cap_us=200000, progress=None):
         """Time the pot path's primitives in microseconds each.
 
         When a scan is much slower than sweep_us() predicts, the argument says
@@ -805,7 +805,15 @@ class Driver:
                 done += 1
                 if time.ticks_diff(time.ticks_us(), t0) > cap:
                     break
-            out.append((label, time.ticks_diff(time.ticks_us(), t0) / done, done))
+            us_each = time.ticks_diff(time.ticks_us(), t0) / done
+            out.append((label, us_each, done))
+            if progress is not None:
+                progress(label, us_each, done)
+                # Report each primitive as it is measured. Delivery of this
+                # board's output can be starved by the very busy-waits being
+                # measured, so a result held until the end may never arrive - and
+                # this also lets a partial answer be read off. sleep_ms yields.
+                time.sleep_ms(1)
 
         timed("sleep_us(10)", lambda: time.sleep_us(10), iters, cap_us)
         timed("sleep_us(100)", lambda: time.sleep_us(100), iters, cap_us)
