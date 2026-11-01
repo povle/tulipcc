@@ -18,6 +18,16 @@
 #     Therefore the full 16-address cycle is scanned and stored first, and
 #     angles are computed afterwards.
 #   - MCP3002 2-ch 10-bit ADC over hardware SPI (GPIO matrix, §3.1).
+#   - 16 NeoPixels under the pots (SK6812 mini), driven from the parameter
+#     values: one LED per pot, white with brightness proportional to the value.
+#     Config (daughterboard.json, "leds"):
+#       pin         slot pin letter (E = GPIO12)
+#       count       number of LEDs (16)
+#       bpp         3 = RGB (GRB), 4 = RGBW (GRBW) - an RGBW part MUST say 4 or
+#                   its W die never lights
+#       brightness  ceiling 0..1 (default 0.30: 16 white LEDs at full are ~1A,
+#                   and the strip shares a supply with the ADC and the DAC)
+#       mode        "white" (level -> brightness), "hue", "manual"
 #
 # Slot pin assignments (from angle_test.ino / Board.h, slot 2):
 #   IO_A_2 = ADDR_CLK             -> slot pin A  (net name on the board)
@@ -153,8 +163,17 @@ ADC_SETTLE_US = 20
 # ~36%. Runtime-tunable via rt.set_pot_scan_rate() for anyone who wants the
 # pot scope to refresh faster.
 SCAN_PERIOD_MS = 33
-# Pot movement that justifies rewriting the LED strip (see _update_leds_auto).
+# Pot movement that justifies rewriting the LED strip (see _update_leds).
 LED_EPSILON = 0.004
+
+# Brightness ceiling for the per-pot LEDs, 0..1 of full white.
+#
+# One SK6812 at 5V full white draws ~60mA (three dies) or ~20mA on its W die, so
+# sixteen of them is ~1A at full tilt - far more than this board's 3V3/5V rails
+# want to supply from the panel, and enough to brown out the ADC next to them.
+# 0.30 gives a clearly readable white at ~290mA (or ~96mA on RGBW W dies) while
+# leaving the supply alone. Runtime-tunable via set_led_max().
+LED_WHITE_MAX = 0.30
 
 # Endless knobs: rotation is reported as DELTAS, not an absolute position.
 #
@@ -291,6 +310,13 @@ class Driver:
         # ~0.5ms of blocking, so pushing every scan (50Hz) wasted 2.5% of the
         # frame to redraw colours that had not changed.
         self._led_shown = [None] * NUM_POTS
+        # Per-LED level, 0..1: what the LED should SHOW, which is the
+        # PARAMETER's value, not the knob's physical angle (an endless knob's
+        # angle means nothing - the same trap as the header readout). The
+        # runtime pushes these with set_led_levels().
+        self._led_level = [0.0] * NUM_POTS
+        self._led_max = float(cfg_entry.get("led_brightness", LED_WHITE_MAX))
+        self._led_bpp = 3
         self._last_scan_ms = None
         # Scan pacing, adjustable at runtime (the pot scope exposes it): None
         # means stopped, which parks the mux so a channel can be probed with a
@@ -301,7 +327,9 @@ class Driver:
         self._single_pot = None
         # NeoPixels (optional, §10.2) — only if configured.
         self._leds = None
-        self._led_mode = "auto"
+        # "white" (level -> brightness of white, the default), "hue" (the old
+        # position-colour map) or "manual" (explicit set_leds).
+        self._led_mode = str(cfg_entry.get("led_mode", "white"))
 
     # --- lifecycle ---
 
@@ -347,8 +375,14 @@ class Driver:
             try:
                 import neopixel
                 n = led_cfg.get("count", NUM_POTS)
+                # SK6812 mini comes in RGB and RGBW. MicroPython's neopixel
+                # writes GRB for bpp=3 and GRBW for bpp=4, so an RGBW part must
+                # be told bpp=4 or its W die never lights and every colour is
+                # one channel short.
+                self._led_bpp = int(led_cfg.get("bpp", 3))
                 self._leds = neopixel.NeoPixel(
-                    self.slot.pin(led_cfg.get("pin", "E"), machine.Pin.OUT), n)
+                    self.slot.pin(led_cfg.get("pin", "E"), machine.Pin.OUT), n,
+                    bpp=self._led_bpp)
             except Exception as e:
                 self._leds = None
                 print("cynthia: pot-board LEDs unavailable:", e)
@@ -473,8 +507,8 @@ class Driver:
             self._scan_all()
         else:
             self._scan_one(self._single_pot)
-        if self._leds and self._led_mode == "auto":
-            self._update_leds_auto()
+        if self._leds and self._led_mode != "manual":
+            self._update_leds()
 
     def _read_all_raw(self, reset=True):
         """One sweep of every address, into _phase0/_phase1. No derived state.
@@ -1256,13 +1290,14 @@ class Driver:
 
     # --- NeoPixels (§10.2) ---
 
-    def _update_leds_auto(self):
-        # LED i tracks pot i: map position to hue across a pleasant range
-        # (0.0 warm/red -> 1.0 cool/blue), constant brightness. Only rewrite
-        # when a pot moved past the threshold; see _led_shown above.
+    def _update_leds(self):
+        """Drive the strip from the pushed levels. Only rewrite on change."""
+        if not self._leds:
+            return
         changed = False
+        max_l = self._led_max
         for i in range(len(self._leds)):
-            v = self.values[i] if i < NUM_POTS else 0.0
+            v = self._led_level[i] if i < NUM_POTS else 0.0
             shown = self._led_shown[i] if i < NUM_POTS else None
             if shown is not None:
                 d = v - shown
@@ -1270,7 +1305,20 @@ class Driver:
                     d = -d
                 if d < LED_EPSILON:
                     continue
-            rgb = _hue_to_rgb(v * 0.66)
+            level = v * max_l
+            if level < 0.0:
+                level = 0.0
+            elif level > 1.0:
+                level = 1.0
+            w = int(level * 255.0 + 0.5)
+            if self._led_mode == "hue":
+                rgb = _hue_to_rgb(v * 0.66)
+            elif self._led_bpp >= 4:
+                # RGBW part: white on the W die only - a true white, and one
+                # die of current instead of three.
+                rgb = (0, 0, 0, w)
+            else:
+                rgb = (w, w, w)
             self._leds[i] = rgb
             if i < NUM_POTS:
                 self._led_shown[i] = v
@@ -1278,11 +1326,53 @@ class Driver:
         if changed:
             self._leds.write()
 
+    def set_led_levels(self, levels):
+        """Set the 0..1 level each LED shows, indexed by pot.
+
+        `levels` is the parameter positions (what the knob is driving), NOT the
+        knobs' physical angles. Copied into a preallocated list, so this is
+        allocation-free and cheap enough to call every poll.
+        """
+        n = len(levels) if len(levels) < NUM_POTS else NUM_POTS
+        for i in range(n):
+            v = levels[i]
+            if v < 0.0:
+                v = 0.0
+            elif v > 1.0:
+                v = 1.0
+            self._led_level[i] = v
+        if self._led_mode != "manual":
+            self._update_leds()
+
+    def led_levels(self):
+        return self._led_level
+
+    def set_led_max(self, v):
+        """Brightness ceiling for the strip, 0..1 (see LED_WHITE_MAX)."""
+        v = float(v)
+        if v < 0.0:
+            v = 0.0
+        elif v > 1.0:
+            v = 1.0
+        self._led_max = v
+        # force a rewrite: the epsilon test would otherwise swallow the change
+        for i in range(NUM_POTS):
+            self._led_shown[i] = None
+        if self._led_mode != "manual":
+            self._update_leds()
+        return self._led_max
+
+    def led_max(self):
+        return self._led_max
+
     def set_led_mode(self, mode):
-        """'auto' (track pots) or 'manual' (explicit set_leds)."""
+        """'white' (default: level -> brightness), 'hue' (position colour) or
+        'manual' (explicit set_leds)."""
         self._led_mode = mode
-        if mode == "auto" and self._leds:
-            self._update_leds_auto()
+        if mode != "manual" and self._leds:
+            for i in range(NUM_POTS):
+                self._led_shown[i] = None      # force a full rewrite
+            self._update_leds()
 
     def set_leds(self, colors):
         """Explicit per-LED (r, g, b); switches to manual mode."""

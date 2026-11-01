@@ -253,6 +253,22 @@ def _seed_pot_positions():
         _pot_pos[ch] = _clamp01(v)
 
 
+def _push_led_levels():
+    """Tell the pot board's LEDs what each parameter is worth now.
+
+    The LEDs show the PARAMETER value, not the knob's physical angle: with
+    endless knobs the angle means nothing (it wraps at 360), so driving the strip
+    from it made brightness jump to 0 mid-turn and disagree with the instrument
+    screen - the same trap as the header readout.
+    """
+    drv = _pot_driver()
+    if drv is not None and hasattr(drv, "set_led_levels"):
+        try:
+            drv.set_led_levels(_pot_pos)
+        except Exception:
+            pass
+
+
 def _apply_knob_deltas(now):
     """Relative mode: move each parameter by the rotation just reported."""
     global _last_knob_ch, _last_knob_time, _last_knob_src
@@ -277,6 +293,7 @@ def _apply_knob_deltas(now):
         _last_knob_ch = target
         _last_knob_src = ch
         _last_knob_time = now
+        _push_led_levels()
         mark_dirty()
 
 
@@ -702,6 +719,7 @@ def play(name):
     # this would snapshot zeros as the baseline and every real position would
     # look like a movement.
     _arm_pot_pickup()
+    _push_led_levels()
     _start_poll()
     _schedule_ble_start()
 
@@ -770,6 +788,7 @@ def attach_current(name):
     _load_knob_map()
     surface.start()
     _arm_pot_pickup()
+    _push_led_levels()
     _start_poll()
     _schedule_ble_start()
     if name is None:
@@ -846,6 +865,7 @@ def set_patch(idx):
     # A newly selected patch owns its parameters: re-arm pot pickup so the
     # physical knob positions do not immediately overwrite it.
     _arm_pot_pickup()
+    _push_led_levels()
     _draw_ui(force=True)
 
 
@@ -856,6 +876,7 @@ def next_patch():
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index + 1)
     _arm_pot_pickup()
+    _push_led_levels()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -867,6 +888,7 @@ def prev_patch():
     elif _engine is not None and hasattr(_engine, "set_patch") and hasattr(_engine, "patch_index"):
         _engine.set_patch(_engine.patch_index - 1)
     _arm_pot_pickup()
+    _push_led_levels()
     _draw_ui(force=True)
     return current_patch_name()
 
@@ -1163,6 +1185,7 @@ def _poll_body(tick):
                 _last_knob_ch = target
                 _last_knob_src = ch
                 _last_knob_time = now
+                _push_led_levels()
                 mark_dirty()
 
     # Forward MIDI that the C input task injected directly (the 28 keys).
@@ -2193,6 +2216,41 @@ def set_pot_deadzone(counts):
     n = drv.set_deadzone_raw(counts)
     print("cynthia: pot deadzone_raw = %d counts" % n)
     return n
+
+
+def set_led_max(v):
+    """REPL: brightness ceiling for the per-pot LEDs, 0..1 (default 0.30).
+
+    Sixteen SK6812s at full white are ~1A; the default keeps them at ~290mA
+    (RGBW W-die ~96mA) because the strip shares a supply with the ADC and the
+    DAC. Raise it only knowing that.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_led_max"):
+        print("cynthia: no pot driver with LED brightness control")
+        return None
+    got = drv.set_led_max(v)
+    print("cynthia: pot LED max = %.2f" % got)
+    return got
+
+
+def set_led_mode(mode):
+    """REPL: 'white' (level -> brightness, default), 'hue', or 'manual'."""
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_led_mode"):
+        print("cynthia: no pot driver with LED control")
+        return None
+    drv.set_led_mode(mode)
+    print("cynthia: pot LED mode = %s" % mode)
+    return mode
+
+
+def led_levels():
+    """REPL: the 0..1 level each pot LED is showing (the parameter values)."""
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "led_levels"):
+        return None
+    return [round(v, 3) for v in drv.led_levels()]
 
 
 def pot_timing():
