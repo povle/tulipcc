@@ -27,6 +27,8 @@
 #                   its W die never lights
 #       brightness  ceiling 0..1 (default 0.30: 16 white LEDs at full are ~1A,
 #                   and the strip shares a supply with the ADC and the DAC)
+#       timing      SK6812 bit timing ns (T0H, T0L, T1H, T1L), default
+#                   (300, 900, 600, 600); pass 1 for the driver's WS2812B set
 #       mode        "white" (level -> brightness), "hue", "manual"
 #
 # Slot pin assignments (from angle_test.ino / Board.h, slot 2):
@@ -174,6 +176,15 @@ LED_EPSILON = 0.004
 # 0.30 gives a clearly readable white at ~290mA (or ~96mA on RGBW W dies) while
 # leaving the supply alone. Runtime-tunable via set_led_max().
 LED_WHITE_MAX = 0.30
+
+# NeoPixel bit timing (T0H, T0L, T1H, T1L) in nanoseconds.
+#
+# The frozen neopixel driver's `timing=1` is WS2812B: (400, 850, 800, 450). The
+# strip here is SK6812 mini, which specifies T1H = 600ns +-150, so an 800ns
+# high is ABOVE its upper bound - out of spec, and the kind of marginal thing
+# that works on the bench and glitches once the ribbon warms up. SK6812 also
+# tolerates a 400ns T0H fine, so its own numbers are safe for both parts.
+LED_TIMING = (300, 900, 600, 600)
 
 # Endless knobs: rotation is reported as DELTAS, not an absolute position.
 #
@@ -380,9 +391,12 @@ class Driver:
                 # be told bpp=4 or its W die never lights and every colour is
                 # one channel short.
                 self._led_bpp = int(led_cfg.get("bpp", 3))
+                timing = led_cfg.get("timing", LED_TIMING)
+                if isinstance(timing, list):
+                    timing = tuple(timing)
                 self._leds = neopixel.NeoPixel(
                     self.slot.pin(led_cfg.get("pin", "E"), machine.Pin.OUT), n,
-                    bpp=self._led_bpp)
+                    bpp=self._led_bpp, timing=timing)
             except Exception as e:
                 self._leds = None
                 print("cynthia: pot-board LEDs unavailable:", e)
