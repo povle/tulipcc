@@ -378,8 +378,16 @@ class Driver:
         self._spi = self.slot.spi(sck="D", mosi="B", miso="C", baudrate=self._spi_baud)
         self._reset_counter()
         time.sleep_ms(10)  # supply ramp for muxes/ADC (from the prototype)
+        # The stock new pot board HAS one SK6812 under every pot, so the strip
+        # defaults ON. It used to require an "leds" block in
+        # daughterboard.json, which meant a config file written before that key
+        # existed silently left the strip undriven - and an undriven SK6812 data
+        # line floats and picks up noise, which reads as "the LEDs flash
+        # sporadically, first bright, second barely".
         led_cfg = self.cfg.get("leds")
-        if led_cfg:
+        if led_cfg is None:
+            led_cfg = {}
+        if led_cfg.get("enabled", True):
             # LEDs are optional. A missing module, a wrong pin or an unpopulated
             # strip must leave the pots working, so this is best-effort: losing
             # the whole driver over a decorative feature is a bad trade.
@@ -1391,6 +1399,7 @@ class Driver:
     def set_leds(self, colors):
         """Explicit per-LED (r, g, b); switches to manual mode."""
         if not self._leds:
+            print("cynthia: no LED strip (leds.enabled false? creation failed?)")
             return
         self._led_mode = "manual"
         for i, c in enumerate(colors):

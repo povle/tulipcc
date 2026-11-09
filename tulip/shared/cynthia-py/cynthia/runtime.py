@@ -2261,12 +2261,20 @@ def led_test(level=0.3, count=16):
     if drv is None or not hasattr(drv, "set_leds"):
         print("cynthia: no pot driver with LED control")
         return None
-    level = max(0.0, min(1.0, float(level)))
+    if not getattr(drv, "_leds", None):
+        # Say it plainly: this used to print a cheerful "16 pixels static" while
+        # set_leds() returned early, so a strip that was never created looked
+        # like a hardware fault.
+        print("cynthia: NO LED STRIP - nothing is driving the data line"
+              " (check leds.enabled in daughterboard.json and the leds setup"
+              " warning printed at boot)")
+        return 0
+    # Same meaning as in normal use: the level is multiplied by the strip's
+    # ceiling, so led_test(0.3) is exactly as bright as a parameter at 0.3.
+    cap = drv.led_max() if hasattr(drv, "led_max") else 1.0
+    level = max(0.0, min(1.0, float(level))) * cap
     w = int(level * 255.0 + 0.5)
-    try:
-        n = len(drv._leds) if getattr(drv, "_leds", None) else count
-    except Exception:
-        n = count
+    n = len(drv._leds)
     drv.set_leds([(w, w, w)] * n)
     print("cynthia: LED test - %d pixels static at %d/255; rt.set_led_mode('white')"
           " to resume" % (n, w))
