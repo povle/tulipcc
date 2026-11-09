@@ -2245,6 +2245,34 @@ def set_led_mode(mode):
     return mode
 
 
+def led_test(level=0.3, count=16):
+    """REPL: freeze the strip at one static white brightness, updates stopped.
+
+    This is the hardware/software split for "the LEDs flicker". In manual mode
+    nothing rewrites the strip: no knob changes, no scans, no brightness passes.
+    If the pattern is rock steady the LEDs and their wiring are fine and the
+    flicker comes from our updates; if it still flickers, it is the data line,
+    the 5V rail or the connector - which is what it usually is, since a 3.3V
+    GPIO into a 5V SK6812 is below its 0.7*VDD input threshold.
+
+    rt.set_led_mode("white") puts it back under normal control.
+    """
+    drv = _pot_driver()
+    if drv is None or not hasattr(drv, "set_leds"):
+        print("cynthia: no pot driver with LED control")
+        return None
+    level = max(0.0, min(1.0, float(level)))
+    w = int(level * 255.0 + 0.5)
+    try:
+        n = len(drv._leds) if getattr(drv, "_leds", None) else count
+    except Exception:
+        n = count
+    drv.set_leds([(w, w, w)] * n)
+    print("cynthia: LED test - %d pixels static at %d/255; rt.set_led_mode('white')"
+          " to resume" % (n, w))
+    return n
+
+
 def led_levels():
     """REPL: the 0..1 level each pot LED is showing (the parameter values)."""
     drv = _pot_driver()
