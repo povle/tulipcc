@@ -64,7 +64,12 @@ class SH1106:
         if i2c is None:
             i2c = I2C(0, scl=Pin(pins.I2C_SCL), sda=Pin(pins.I2C_SDA), freq=400000)
         self.i2c = i2c
-        self._write_cmd(0x20, 0x00)    # horizontal addressing mode (for 0x21/0x22)
+        # NOTE: no 0x20/0x21/0x22 memory-addressing commands here. Those are
+        # SSD1306 commands; the SH1106 has no addressing mode at all - it takes
+        # a page (0xB0|page) and a column, and its column pointer wraps within
+        # the row instead of advancing to the next page. Sending them put the
+        # panel in an undefined state, and a single 1024-byte write then filled
+        # page 0 eight times over, which is what garbled the screen.
         # Shadow of what the panel is actually showing, so show() can skip pages
         # that did not change. None until the first frame.
         self._shadow = None
@@ -93,7 +98,8 @@ class SH1106:
         self._write_cmd(0xD3, 0x00)  # Display offset
         self._write_cmd(0x40)  # Start line 0
         self._write_cmd(0xAD, 0x8B)  # SH1106 DC-DC pump control (on)
-        self._write_cmd(0x20, 0x00)  # Memory mode: horizontal
+        # (No "memory addressing mode" command: that is SSD1306. The SH1106 has
+        # none, and sending it leaves the panel in an undefined state.)
         if self.rotate == 2:
             self._write_cmd(0xA1)  # Segment remap (for 180° rotation)
             self._write_cmd(0xC8)  # COM scan direction (for 180° rotation)
@@ -117,10 +123,11 @@ class SH1106:
         this keeps a shadow copy of what the panel is showing and sends only the
         pages that changed.
 
-        All 8 pages changing is the common case when the UI clears and redraws
-        the whole screen, so when that happens the frame goes out as ONE command
-        transaction (horizontal addressing window for the 8 pages) plus ONE data
-        transaction, instead of 16 transactions of 8 pages.
+        Pages go out one at a time, each preceded by its own 0xB0|page. That is
+        not an oversight: the SH1106 has no horizontal addressing mode, so a
+        single 1024-byte stream cannot cross pages - it wraps within the row and
+        overwrites page 0 (which is exactly how an earlier "one transaction for
+        the whole frame" attempt garbled the screen).
 
         force=True repaints everything (after anything that could have left the
         panel's RAM out of step, e.g. a reset).
@@ -137,28 +144,23 @@ class SH1106:
                 self.show_calls += 1
                 self.show_us_total += time.ticks_diff(time.ticks_us(), t0)
                 return
-        if len(pages) == 8:
-            # Whole frame: set the window once, then one data stream.
-            self._write_cmd(0x21, _COL_OFFSET, _COL_OFFSET + WIDTH - 1)  # columns
-            self._write_cmd(0x22, 0, 7)                                  # pages
+        # Always page by page: the SH1106 has no horizontal addressing mode, so
+        # one 1024-byte stream cannot cross pages (it wraps inside the row and
+        # overwrites page 0). The dirty-page test above is where the win is - a
+        # knob turn touches one or two pages - and the extra command
+        # transactions cost nothing measurable next to 128 bytes of data.
+        for page in pages:
+            self._write_cmd(
+                0xB0 | page,  # Set page address
+                0x00 | (_COL_OFFSET & 0x0F),  # Lower column address
+                0x10 | ((_COL_OFFSET >> 4) & 0x0F),  # Upper column address
+            )
+            o = page * WIDTH
             try:
-                self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[:]))
+                self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[o:o + WIDTH]))
             except (AttributeError, TypeError):
-                self.i2c.writeto(self.addr, bytes([_DATA]) + buf[:])
-            self.pages_total += 8
-        else:
-            for page in pages:
-                self._write_cmd(
-                    0xB0 | page,  # Set page address
-                    0x00 | (_COL_OFFSET & 0x0F),  # Lower column address
-                    0x10 | ((_COL_OFFSET >> 4) & 0x0F),  # Upper column address
-                )
-                o = page * WIDTH
-                try:
-                    self.i2c.writevto(self.addr, (b'\x40', memoryview(buf)[o:o + WIDTH]))
-                except (AttributeError, TypeError):
-                    self.i2c.writeto(self.addr, bytes([_DATA]) + buf[o:o + WIDTH])
-            self.pages_total += len(pages)
+                self.i2c.writeto(self.addr, bytes([_DATA]) + buf[o:o + WIDTH])
+        self.pages_total += len(pages)
         self.show_calls += 1
         self.show_us_total += time.ticks_diff(time.ticks_us(), t0)
         if sh is None:
