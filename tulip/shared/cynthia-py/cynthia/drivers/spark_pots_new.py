@@ -165,9 +165,6 @@ ADC_SETTLE_US = 20
 # ~36%. Runtime-tunable via rt.set_pot_scan_rate() for anyone who wants the
 # pot scope to refresh faster.
 SCAN_PERIOD_MS = 33
-# Pot movement that justifies rewriting the LED strip (see _update_leds).
-LED_EPSILON = 0.004
-
 # Brightness ceiling for the per-pot LEDs, 0..1 of full white.
 #
 # One SK6812 at 5V full white draws ~60mA (three dies) or ~20mA on its W die, so
@@ -321,11 +318,17 @@ class Driver:
         # ~0.5ms of blocking, so pushing every scan (50Hz) wasted 2.5% of the
         # frame to redraw colours that had not changed.
         self._led_shown = [None] * NUM_POTS
+        # Last brightness byte actually written per LED: gating on the OUTPUT
+        # byte rather than on the 0.004 level step means every visible change is
+        # sent and nothing invisible is.
+        self._led_byte = [None] * NUM_POTS
         # Per-LED level, 0..1: what the LED should SHOW, which is the
         # PARAMETER's value, not the knob's physical angle (an endless knob's
         # angle means nothing - the same trap as the header readout). The
         # runtime pushes these with set_led_levels().
         self._led_level = [0.0] * NUM_POTS
+        # Rotation not yet turned into a delta (inside the deadband), in turns.
+        self._resid = [0.0] * NUM_POTS
         self._led_max = float(cfg_entry.get("led_brightness", LED_WHITE_MAX))
         self._led_bpp = 3
         self._last_scan_ms = None
@@ -722,6 +725,10 @@ class Driver:
             d -= 360.0
         elif d < -180.0:
             d += 360.0
+        # Remember the sub-deadband rotation: the LED shows it so the strip
+        # tracks the hand continuously, while the PARAMETER keeps its 7 degree
+        # hysteresis (that hysteresis is what stops noise accumulating).
+        self._resid[i] = 0.0 if (d >= self._deadband or d <= -self._deadband) else d / 360.0
         if d >= self._deadband or d <= -self._deadband:
             turns = d / 360.0
             # Odd-indexed pots sit on the back of the board, so their
@@ -1320,19 +1327,14 @@ class Driver:
         max_l = self._led_max
         for i in range(len(self._leds)):
             v = self._led_level[i] if i < NUM_POTS else 0.0
-            shown = self._led_shown[i] if i < NUM_POTS else None
-            if shown is not None:
-                d = v - shown
-                if d < 0:
-                    d = -d
-                if d < LED_EPSILON:
-                    continue
             level = v * max_l
             if level < 0.0:
                 level = 0.0
             elif level > 1.0:
                 level = 1.0
             w = int(level * 255.0 + 0.5)
+            if i < NUM_POTS and self._led_byte[i] == w:
+                continue                      # same brightness: nothing to send
             if self._led_mode == "hue":
                 rgb = _hue_to_rgb(v * 0.66)
             elif self._led_bpp >= 4:
@@ -1344,6 +1346,7 @@ class Driver:
             self._leds[i] = rgb
             if i < NUM_POTS:
                 self._led_shown[i] = v
+                self._led_byte[i] = w
             changed = True
         if changed:
             self._leds.write()
@@ -1368,6 +1371,10 @@ class Driver:
 
     def led_levels(self):
         return self._led_level
+
+    def led_residual(self, i):
+        """Rotation sitting inside the deadband for pot `i`, in turns (0..1)."""
+        return self._resid[i]
 
     def set_led_max(self, v):
         """Brightness ceiling for the strip, 0..1 (see LED_WHITE_MAX)."""

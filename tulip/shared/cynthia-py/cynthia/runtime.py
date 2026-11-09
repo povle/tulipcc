@@ -253,6 +253,10 @@ def _seed_pot_positions():
         _pot_pos[ch] = _clamp01(v)
 
 
+# Scratch for the LED levels, so pushing them every poll allocates nothing.
+_LED_SCRATCH = [0.0] * 16
+
+
 def _push_led_levels():
     """Tell the pot board's LEDs what each parameter is worth now.
 
@@ -260,13 +264,31 @@ def _push_led_levels():
     endless knobs the angle means nothing (it wraps at 360), so driving the strip
     from it made brightness jump to 0 mid-turn and disagree with the instrument
     screen - the same trap as the header readout.
+
+    Called every poll, and it adds the rotation still sitting inside the knob's
+    deadband. The parameter keeps its 7 degree hysteresis (that is what stops
+    noise accumulating into drift), but the strip does not have to: showing the
+    sub-deadband rotation lets it follow the hand smoothly, at the poll rate,
+    between the steps the parameter actually takes.
     """
     drv = _pot_driver()
-    if drv is not None and hasattr(drv, "set_led_levels"):
-        try:
-            drv.set_led_levels(_pot_pos)
-        except Exception:
-            pass
+    if drv is None or not hasattr(drv, "set_led_levels"):
+        return
+    resid = getattr(drv, "led_residual", None)
+    n = len(_pot_pos)
+    if n > len(_LED_SCRATCH):
+        n = len(_LED_SCRATCH)
+    try:
+        for i in range(n):
+            v = _pot_pos[i]
+            if resid is not None:
+                v += resid(i)
+            _LED_SCRATCH[i] = v
+        for i in range(n, len(_LED_SCRATCH)):
+            _LED_SCRATCH[i] = 0.0
+        drv.set_led_levels(_LED_SCRATCH)
+    except Exception:
+        pass
 
 
 def _apply_knob_deltas(now):
@@ -293,7 +315,6 @@ def _apply_knob_deltas(now):
         _last_knob_ch = target
         _last_knob_src = ch
         _last_knob_time = now
-        _push_led_levels()
         mark_dirty()
 
 
@@ -1185,7 +1206,6 @@ def _poll_body(tick):
                 _last_knob_ch = target
                 _last_knob_src = ch
                 _last_knob_time = now
-                _push_led_levels()
                 mark_dirty()
 
     # Forward MIDI that the C input task injected directly (the 28 keys).
@@ -1193,6 +1213,11 @@ def _poll_body(tick):
     # and the host received joystick/pot traffic but no notes at all.
     _drain_midi_tap()
 
+
+    # Show the knob positions on the pot-board LEDs, once per poll: every poll
+    # is ~57Hz, which is the strip's practical frame rate, and the driver only
+    # rewrites a pixel when its brightness byte actually changes.
+    _push_led_levels()
 
     # Joystick → MIDI pitch bend (X axis) + modulation (Y axis), C++ style.
     #
