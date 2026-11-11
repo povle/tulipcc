@@ -11,6 +11,12 @@
 #define CONFIG_I2S_DOUT (39)
 #define CONFIG_I2S_DIN (-1)
 
+// === I2S ICS-43434 microphone ===
+// WS=41, SCK=42, SD=44 (U0RXD / module pin 36).
+#define CONFIG_MIC_WS (41)
+#define CONFIG_MIC_SCK (42)
+#define CONFIG_MIC_SD (44)
+
 // === I2C Bus 0 (ADS1115 + optional MCP23017s) ===
 // SDA=GPIO17, SCL=GPIO16
 #define I2C_MASTER_SDA (17)

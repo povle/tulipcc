@@ -764,6 +764,12 @@ extern int8_t cynthia_get_octave_shift(void);
 extern void cynthia_set_octave_shift(int8_t shift);
 extern bool cynthia_pot_scan_enable(bool on);
 extern bool cynthia_pot_scan_enabled(void);
+extern uint32_t cynthia_mic_record(uint32_t seconds);
+extern uint32_t cynthia_mic_len(void);
+extern const int16_t *cynthia_mic_ptr(void);
+extern uint32_t cynthia_mic_rate(void);
+extern uint32_t cynthia_mic_max_samples(void);
+extern void cynthia_mic_release(void);
 extern void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port);
 extern int16_t cynthia_ui_str_width(uint8_t font_idx, const char *str);
 extern int16_t cynthia_ui_draw_str(uint8_t *buf, uint8_t font_idx, int16_t x, int16_t y, const char *str, uint8_t color);
@@ -795,6 +801,12 @@ static inline int8_t cynthia_get_octave_shift(void) { return 0; }
 static inline void cynthia_set_octave_shift(int8_t shift) {}
 static inline bool cynthia_pot_scan_enable(bool on) { (void)on; return false; }
 static inline bool cynthia_pot_scan_enabled(void) { return false; }
+static inline uint32_t cynthia_mic_record(uint32_t seconds) { (void)seconds; return 0; }
+static inline uint32_t cynthia_mic_len(void) { return 0; }
+static inline const int16_t *cynthia_mic_ptr(void) { return NULL; }
+static inline uint32_t cynthia_mic_rate(void) { return 0; }
+static inline uint32_t cynthia_mic_max_samples(void) { return 0; }
+static inline void cynthia_mic_release(void) {}
 static inline void cynthia_get_debug_status(uint32_t *out_loops, uint32_t *out_ads_reads, uint8_t *out_ads_present, uint8_t *out_ads_port) {
     if (out_loops) *out_loops = 0;
     if (out_ads_reads) *out_ads_reads = 0;
@@ -881,6 +893,45 @@ STATIC mp_obj_t tulip_cynthia_octave_shift(size_t n_args, const mp_obj_t *args) 
     return mp_obj_new_int(cynthia_get_octave_shift());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_octave_shift_obj, 0, 1, tulip_cynthia_octave_shift);
+
+// I2S mic capture. AMY's own audio-input path cannot reach this board's mic (its
+// config carries one set of I2S pins, shared with the DAC, and CYNTHIA's mic is
+// on its own bus), so the capture lives in cynthia_mic.c and the bytes are
+// handed to AMY's Python sampler API (amy.load_sample_bytes).
+STATIC mp_obj_t tulip_cynthia_mic_record(mp_obj_t seconds_obj) {
+    uint32_t want = (uint32_t)mp_obj_get_int(seconds_obj);
+    uint32_t got = cynthia_mic_record(want);
+    return mp_obj_new_int((mp_int_t)got);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(tulip_cynthia_mic_record_obj, tulip_cynthia_mic_record);
+
+// The captured audio as 16-bit signed little-endian mono, ready to hand
+// straight to amy.load_sample_bytes().
+STATIC mp_obj_t tulip_cynthia_mic_bytes(void) {
+    uint32_t n = cynthia_mic_len();
+    const int16_t *p = cynthia_mic_ptr();
+    if (n == 0 || p == NULL) {
+        return mp_const_none;
+    }
+    return mp_obj_new_bytes((const byte *)p, (size_t)n * sizeof(int16_t));
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_mic_bytes_obj, tulip_cynthia_mic_bytes);
+
+STATIC mp_obj_t tulip_cynthia_mic_info(void) {
+    mp_obj_t items[3] = {
+        mp_obj_new_int((mp_int_t)cynthia_mic_len()),
+        mp_obj_new_int((mp_int_t)cynthia_mic_rate()),
+        mp_obj_new_int((mp_int_t)cynthia_mic_max_samples()),
+    };
+    return mp_obj_new_tuple(3, items);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_mic_info_obj, tulip_cynthia_mic_info);
+
+STATIC mp_obj_t tulip_cynthia_mic_free(void) {
+    cynthia_mic_release();
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_mic_free_obj, tulip_cynthia_mic_free);
 
 // The legacy C pot scan bit-bangs an address on four GPIOs that, on the current
 // pot board, are the counter CLK and the MCP3002 SPI bus. A slot driver that
@@ -2107,6 +2158,10 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_errors), MP_ROM_PTR(&tulip_i2c_bg_errors_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_knobs), MP_ROM_PTR(&tulip_cynthia_knobs_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_pot_scan), MP_ROM_PTR(&tulip_cynthia_pot_scan_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_mic_record), MP_ROM_PTR(&tulip_cynthia_mic_record_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_mic_bytes), MP_ROM_PTR(&tulip_cynthia_mic_bytes_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_mic_info), MP_ROM_PTR(&tulip_cynthia_mic_info_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_mic_free), MP_ROM_PTR(&tulip_cynthia_mic_free_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_joystick), MP_ROM_PTR(&tulip_cynthia_joystick_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_buttons), MP_ROM_PTR(&tulip_cynthia_buttons_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_button_event), MP_ROM_PTR(&tulip_cynthia_button_event_obj) },
