@@ -585,3 +585,42 @@ sweep, not the clock rates.
 Budget arithmetic from that: the old 20 ms scan period was 59% of the task by
 itself (now 33 ms / ~36%), and the UI poll is the other ~44%. Both together
 have to stay under 100%, so changing either needs the other in mind.
+
+## Fast turns lost, slow turns stepping: two bars set for the wrong scan period
+
+Reported as "pots often skip a turn when turned quickly, and the change is
+choppy". Neither was the scan rate — both were thresholds written for a 20ms
+scan that the driver no longer runs at (it was moved to 33ms when the 20ms
+period saturated the CPU, see the budget note above).
+
+**The skip.** The temporal guard rejected a sample whose angle moved 90 deg
+since the last one, as a wiper-flip glitch, *holding the old value*. 90 deg was
+justified as "nothing a hand can do moves 90 deg in one 20ms scan" — true, but
+at 33ms that is 2.7 turns/s, and the scan interval is not even reliably 33ms:
+a scan delayed by the UI poll makes the *effective* bar as low as ~1 turn/s.
+A quick flick then tripped it and the whole turn disappeared. The bar is now
+scaled by the measured time since the last sample (GLITCH_DEG_PER_S = 3000,
+8.3 turns/s) with the old 90 deg as a floor, so the guard rejects a genuine
+180 deg wiper flip at any interval but never eats real motion.
+
+**The chop.** The 7 deg deadband is the *still-knob* noise bar and cannot be
+lowered — 5 deg was measured to sit inside the +-3.3 deg noise and emitted
+spurious deltas with nothing touched. But on a moving knob it is pure lag: at
+120 deg/s a hand crosses 7 deg in 58ms, so the parameter advanced every second
+or third scan instead of following. The bar is now adaptive: 7 deg until a turn
+is under way, then 3 deg while it is, reverting after MOVING_HOLD_SCANS quiet
+scans. The median filter and the direction continuity are what keep the narrow
+bar honest while moving; the still-knob noise test is unchanged.
+
+Verified on the host harness against the real driver class (stubbed machine +
+raw wiper values), 5 cases: 3.3 rev/s track exact with 0 glitches; +-3.3 deg
+noise for 40 scans emits nothing; steady-state delta interval at 60 deg/s
+halved 4 -> 2 scans; a 150 deg step across a 200ms (UI-delayed) scan is
+accepted where the fixed bar dropped it; a 180 deg flip still rejected.
+
+**Rate ceiling.** All 16 pots are populated, so the sweep is genuinely 32 ADC
+reads / 64 SPI transactions and ~12ms, dominated by per-operation Python
+overhead (the numbers above). The period therefore stays 33ms: 20ms would be
+~59% of the CPU on top of the UI poll's ~44%. Raising the *rate* from here
+needs the sweep in C (the same primitives at hardware speed are ~3.5ms),
+not a shorter period or a subset of addresses.

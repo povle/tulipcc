@@ -161,9 +161,13 @@ ADC_SETTLE_US = 20
 # the panel felt sluggish and why anything added here (the read-repair logic)
 # made it worse.
 #
-# 33ms (30Hz) is still far faster than a hand can turn a pot and drops this to
-# ~36%. Runtime-tunable via rt.set_pot_scan_rate() for anyone who wants the
-# pot scope to refresh faster.
+# 33ms (30Hz). A full sweep is 16 addresses x (settle + dummy + real) = ~12ms
+# measured on the panel, so the rate is set by the sweep, not by taste: 20ms
+# would be ~59% of the CPU and the UI poll's own 14.8ms per frame adds ~44%,
+# i.e. saturated - which is why the panel went sluggish at 50Hz before. All 16
+# pots are populated, so there is no cheap subset to sweep. Going faster needs
+# the sweep in C (32 SPI transactions at hardware speed ~3.5ms) rather than
+# stealing from the UI. Runtime-tunable via rt.set_pot_scan_rate().
 SCAN_PERIOD_MS = 33
 # Brightness ceiling for the per-pot LEDs, 0..1 of full white.
 #
@@ -201,13 +205,33 @@ LED_TIMING = (300, 900, 600, 600)
 # tracking a 90-degree turn to within 0.001 turns. Lower this
 # (rt.set_pot_deadband) once the panel is reflowed if the signal is clean -
 # every degree here is one degree of end-of-turn lag.
+# 7 deg is the STILL-knob bar and has to stay: 5 deg was measured to sit inside
+# the +-3.3 deg noise and emitted spurious deltas while nothing was touched.
+#
+# It is, however, pure lag while the knob IS moving: a hand at a comfortable
+# 120 deg/s crosses 7 deg in 58ms, so the parameter advanced only every second
+# or third scan and stepped instead of following the hand (reported as
+# "choppy"). Once a turn is under way, noise is no longer what limits us - the
+# median-of-3 and the direction continuity are - so the bar drops to
+# DELTA_DEADBAND_MOVING_DEG until the knob has been quiet for MOVING_HOLD_SCANS.
 DELTA_DEADBAND_DEG = 7.0
+DELTA_DEADBAND_MOVING_DEG = 3.0
+MOVING_HOLD_SCANS = 4
 
-# Rotation per scan that no hand can produce. At 50Hz a 90-degree step would be
-# 25 turns/second. Anything bigger is a sensing glitch (typically the two wipers
+# Rotation per scan that no hand can produce: 90 deg in a 20ms scan is 12.5
+# turns/second. Anything bigger is a sensing glitch (typically the two wipers
 # being reconciled 180 degrees apart), so it is dropped and counted instead of
 # slammed into a parameter. `debug()` exposes the count.
+#
+# 90 deg is the FLOOR: the real limit scales with the time since the last
+# committed sample (GLITCH_DEG_PER_S), because a fixed bar is wrong whenever the
+# scan is slower than assumed - it was written for 20ms, the scan ran at 33ms
+# for a while, and the UI poll can delay a scan further. At 33ms, 90 deg is only
+# 2.7 turns/s, so a quick flick tripped it and the sample was DISCARDED with the
+# value held - a whole turn silently lost, which is what "it skips a turn when
+# turned quickly" was.
 GLITCH_DEG = 90.0
+GLITCH_DEG_PER_S = 3000.0   # 8.3 turns/second, beyond any hand
 
 
 def _median3(a, b, c):
@@ -329,6 +353,17 @@ class Driver:
         self._led_level = [0.0] * NUM_POTS
         # Rotation not yet turned into a delta (inside the deadband), in turns.
         self._resid = [0.0] * NUM_POTS
+        # Deadband state: narrow bar while a turn is under way, wide bar once
+        # the knob has been quiet for MOVING_HOLD_SCANS (see the constants).
+        try:
+            self._deadband_moving = float(cfg_entry.get(
+                "delta_deadband_moving_deg", DELTA_DEADBAND_MOVING_DEG))
+        except (TypeError, ValueError):
+            self._deadband_moving = DELTA_DEADBAND_MOVING_DEG
+        self._moving = [False] * NUM_POTS
+        self._idle = [0] * NUM_POTS
+        # Time since the previous scan, for the time-scaled glitch guard.
+        self._dt_ms = SCAN_PERIOD_MS
         self._led_max = float(cfg_entry.get("led_brightness", LED_WHITE_MAX))
         self._led_bpp = 3
         self._last_scan_ms = None
@@ -528,6 +563,17 @@ class Driver:
         Call at a paced rate (§8). Full mode is 32 SPI reads + settles (~3.4ms);
         single-pot mode touches only that pot's two addresses.
         """
+        now = time.ticks_ms()
+        if self._last_scan_ms is None:
+            dt = self._scan_period_ms
+        else:
+            dt = time.ticks_diff(now, self._last_scan_ms)
+        # A scan delayed past a second means we lost the thread; treat it as a
+        # normal period so one hiccup does not unlock the glitch guard.
+        if dt <= 0 or dt > 1000:
+            dt = self._scan_period_ms
+        self._dt_ms = dt
+        self._last_scan_ms = now
         if self._single_pot is None:
             self._scan_all()
         else:
@@ -697,7 +743,13 @@ class Driver:
                 dd -= 360.0
             elif dd < -180.0:
                 dd += 360.0
-            if dd >= GLITCH_DEG or dd <= -GLITCH_DEG:
+            # Temporal plausibility, scaled by the time since the last sample:
+            # GLITCH_DEG is the floor for a normal scan, and the limit grows
+            # with a slow one. A fixed bar lost real fast turns (see GLITCH_DEG).
+            lim = GLITCH_DEG_PER_S * self._dt_ms / 1000.0
+            if lim < GLITCH_DEG:
+                lim = GLITCH_DEG
+            if dd >= lim or dd <= -lim:
                 self._glitches += 1
                 self._stale[i] = True
                 ang = self.values[i] * 360.0
@@ -728,8 +780,14 @@ class Driver:
         # Remember the sub-deadband rotation: the LED shows it so the strip
         # tracks the hand continuously, while the PARAMETER keeps its 7 degree
         # hysteresis (that hysteresis is what stops noise accumulating).
-        self._resid[i] = 0.0 if (d >= self._deadband or d <= -self._deadband) else d / 360.0
-        if d >= self._deadband or d <= -self._deadband:
+        # While the knob is turning, use the narrow bar: the wide one is there to
+        # reject noise on a still knob, and on a moving one it is just lag (see
+        # DELTA_DEADBAND_MOVING_DEG).
+        db = self._deadband_moving if self._moving[i] else self._deadband
+        self._resid[i] = 0.0 if (d >= db or d <= -db) else d / 360.0
+        if d >= db or d <= -db:
+            self._moving[i] = True
+            self._idle[i] = 0
             turns = d / 360.0
             # Odd-indexed pots sit on the back of the board, so their
             # rotation is mechanically inverted. Flip the DELTA rather than
@@ -740,15 +798,23 @@ class Driver:
             self._delta[i] += turns
             self._has_delta = True
             self._anchor[i] = ang
+        else:
+            # Nothing emitted: after a few quiet scans the knob counts as
+            # still again and the wide noise bar comes back.
+            self._idle[i] += 1
+            if self._idle[i] >= MOVING_HOLD_SCANS:
+                self._moving[i] = False
 
     def poll(self, now_ms=None):
         """Scan at a PACED rate, not on every call.
 
-        A full scan is 16 addresses x (mux settle + 2 ADC reads) = ~3.8ms of
-        BLOCKING time.sleep_us settles. surface.poll() runs from the UI poll at
-        ~96Hz, whose whole budget is ~10ms, so scanning every call burned ~37% of
-        the frame in busy-waiting — and starved the same poll that feeds the
-        software watchdog. Pots are mechanical; nobody can turn 16 of them faster
+        A full scan is 16 addresses x (mux settle + 2 ADC reads): ~3.2ms of
+        BLOCKING time.sleep_us settles plus 64 SPI transactions driven from
+        Python, ~12ms measured on the panel. surface.poll() runs from the UI
+        poll, whose own frame is ~14.8ms, so scanning every call (or on a 20ms
+        period) saturates the CPU and the panel goes sluggish — that is why the
+        period is 33ms and why going faster needs the sweep in C, not a shorter
+        period here. Pots are mechanical; nobody can turn 16 of them faster
         than ~50Hz. Pace it so a scan costs at most a fraction of the budget.
         """
         if now_ms is None:
