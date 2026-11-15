@@ -202,7 +202,11 @@ MAX_SCAN_PERIOD_MS = 50
 # the deadband means nothing happens until it moves - and the 40ms sweep is what
 # notices it starting to.
 HOT_MS = 250                  # how long a pot stays hot after its last movement
-HOT_SCAN_PERIOD_MS = 3        # ~330Hz for the pot in your hand
+# 2ms, not 3: a single-pot poll costs ~0.4ms, so this is ~20% of the thread, and
+# the point is SAMPLES PER DEGREE. The angle noise is per sample, so more samples
+# across a given amount of travel averages it down - which is what linearity at
+# high speed needs. (Raising the deadband cannot do that; it only adds lag.)
+HOT_SCAN_PERIOD_MS = 2        # ~500Hz for the pot in your hand
 IDLE_SCAN_PERIOD_MS = 40      # full sweep cadence while something is hot
 # Brightness ceiling for the per-pot LEDs, 0..1 of full white.
 #
@@ -551,6 +555,8 @@ class Driver:
             except Exception as e:
                 self._leds = None
                 print("cynthia: pot-board LEDs unavailable:", e)
+        if self._leds is not None and self.cfg.get("boot_animation", True):
+            self._boot_animation()
 
     def stop(self):
         # Release the SPI host too: machine.SPI(id) cannot be created twice, so
@@ -1768,6 +1774,32 @@ class Driver:
         return out
 
     # --- NeoPixels (§10.2) ---
+
+    def _boot_animation(self):
+        """Light the strip one LED at a time, then sweep it out.
+
+        Runs once, at driver start, before any parameter drives the strip - the
+        only moment the LEDs are free to say something rather than show a knob
+        position. ~0.45s total (16 x 22ms up, 16 x 6ms down), so it reads as a
+        quick sweep rather than a delay in the boot.
+        """
+        n = len(self._leds)
+        w = int(self._led_max * 255.0 + 0.5)
+        on = (0, 0, 0, w) if self._led_bpp >= 4 else (w, w, w)
+        off = (0, 0, 0, 0) if self._led_bpp >= 4 else (0, 0, 0)
+        for i in range(n):
+            self._leds[i] = on
+            self._leds.write()
+            time.sleep_ms(22)
+        time.sleep_ms(70)
+        for i in range(n):
+            self._leds[i] = off
+            self._leds.write()
+            time.sleep_ms(6)
+        # Forget what the strip was last told: the first real update must
+        # rewrite every LED instead of assuming the animation left it dark.
+        for i in range(NUM_POTS):
+            self._led_byte[i] = None
 
     def _update_leds(self):
         """Drive the strip from the pushed levels. Only rewrite on change."""
