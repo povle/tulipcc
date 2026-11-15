@@ -403,6 +403,11 @@ class Driver:
         self._scan_saved_ms = SCAN_PERIOD_MS
         # Measured cost of one scan, and whether the period follows it.
         self._sweep_ms = SCAN_PERIOD_MS / AUTO_PACE_FACTOR
+        # Where that time goes: bus reads, per-pot maths, LED write. Printed by
+        # pots_report() - guessing at the split wasted a round trip already.
+        self._raw_ms = 0.0
+        self._update_ms = 0.0
+        self._leds_ms = 0.0
         self._auto_pace = bool(cfg_entry.get("auto_pace", True))
         # None = visit every address; an index = only poll that pot.
         self._single_pot = None
@@ -644,8 +649,10 @@ class Driver:
         else:
             self._scan_one(self._single_pot)
         self._sweep_ms = time.ticks_diff(time.ticks_us(), t_start) / 1000.0
+        t_led = time.ticks_us()
         if self._leds and self._led_mode != "manual":
             self._update_leds()
+        self._leds_ms = time.ticks_diff(time.ticks_us(), t_led) / 1000.0
 
     def _start_c_sweep(self):
         """Claim the SPI host for the C sweep, and prove it works first.
@@ -807,15 +814,19 @@ class Driver:
         # counter step shifts the data by one sensor: the pair check catches
         # that in the first half, and the second half is re-read and compared.
         for _attempt in range(SCAN_RETRIES):
+            t_raw = time.ticks_us()
             self._read_all_raw()
+            self._raw_ms = time.ticks_diff(time.ticks_us(), t_raw) / 1000.0
             if self._bad_pair_count() > SHIFT_BAD_PAIRS:
                 self._scan_retries += 1
                 continue
             if self._verify and self._verify_sweep() > VERIFY_BAD_MAX:
                 self._scan_retries += 1
                 continue
+            t_upd = time.ticks_us()
             for i in range(NUM_POTS):
                 self._update_pot(i)
+            self._update_ms = time.ticks_diff(time.ticks_us(), t_upd) / 1000.0
             return True
         # Every attempt looked address-corrupt. Commit the last sweep anyway
         # rather than nothing: a board that trips the checks every time would
@@ -855,6 +866,17 @@ class Driver:
         self._r0p1[i] = r0
         self._r1p2[i] = self._r1p1[i]
         self._r1p1[i] = r1
+
+        # Fast path: if the MEDIAN-FILTERED reading is unchanged, the angle is
+        # unchanged, so there is no delta, no anchor move and nothing to apply.
+        # Skipping here is worth ~40 VM operations per still pot per scan, and
+        # with 16 pots that is most of the scan: the median absorbs the +-1 count
+        # jitter, so an untouched panel takes this path almost every time.
+        if m0 == self._used0[i] and m1 == self._used1[i]:
+            self._idle[i] += 1
+            if self._idle[i] >= MOVING_HOLD_SCANS:
+                self._moving[i] = False
+            return
 
         ang, src = self._compute_angle_ex(m0, m1, self._src[i])
         resync = False
@@ -1475,6 +1497,10 @@ class Driver:
     def sweep_ms(self):
         """Measured cost of the last scan, ms. Auto-pacing is 2x this."""
         return self._sweep_ms
+
+    def sweep_breakdown(self):
+        """(raw bus, per-pot maths, LED write) ms for the last scan."""
+        return (self._raw_ms, self._update_ms, self._leds_ms)
 
     def auto_pace(self, on=None):
         """Read or set whether the scan period follows the measured sweep."""

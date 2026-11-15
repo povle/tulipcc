@@ -145,6 +145,9 @@ def pots_report():
                  "stopped" if period is None else "%d ms" % period,
                  "C" if mode == "c" else ("Python" if mode == "python" else mode),
                  " (auto 2x)" if getattr(drv, "auto_pace", lambda: False)() else ""))
+        if hasattr(drv, "sweep_breakdown"):
+            r, u, l = drv.sweep_breakdown()
+            print("      bus %.2f ms + maths %.2f ms + leds %.2f ms" % (r, u, l))
     if hasattr(drv, "timing"):
         baud, settle = drv.timing()
         print("spi: %d Hz   mux settle: %d us" % (baud, settle))
