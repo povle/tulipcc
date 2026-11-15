@@ -264,6 +264,14 @@ MOVING_HOLD_SCANS = 4
 GLITCH_DEG = 90.0
 GLITCH_DEG_PER_S = 3000.0   # 8.3 turns/second, beyond any hand
 
+# A jump that REVERSES the direction the knob was moving is held to a much
+# tighter bar than one that continues it. A hand cannot reverse at the speed a
+# wiper artifact can: a real reversal starts from near zero, so at a 16ms scan
+# even 5 turns/second is ~29 deg. Without this, a wiper artifact of up to 90 deg
+# in the opposite direction passed the guard and became real parameter movement
+# - which is how a rapid turn still ended up going the wrong way.
+REVERSE_GLITCH_DEG = 30.0
+
 
 def _median3(a, b, c):
     """Median of three, tolerating missing history (None -> return c).
@@ -395,6 +403,8 @@ class Driver:
             self._deadband_moving = DELTA_DEADBAND_MOVING_DEG
         self._moving = [False] * NUM_POTS
         self._idle = [0] * NUM_POTS
+        # +1/-1: the direction of the last emitted delta, for the reverse guard.
+        self._last_dir = [0] * NUM_POTS
         # Which wiper produced the angle last scan (None = they were averaged),
         # so the source does not flip between scans across a compressed wiper.
         self._src = [None] * NUM_POTS
@@ -898,6 +908,7 @@ class Driver:
             self._idle[i] += 1
             if self._idle[i] >= MOVING_HOLD_SCANS:
                 self._moving[i] = False
+                self._last_dir[i] = 0
             return
 
         ang, src = self._compute_angle_ex(m0, m1, self._src[i])
@@ -949,6 +960,16 @@ class Driver:
             lim = GLITCH_DEG_PER_S * self._dt_ms / 1000.0
             if lim < GLITCH_DEG:
                 lim = GLITCH_DEG
+            # Reversing is held to a tighter bar than continuing (see
+            # REVERSE_GLITCH_DEG): a wiper artifact against the direction of
+            # travel is what made rapid turns land the wrong way.
+            d_prev = self._last_dir[i]
+            if d_prev < 0:
+                if dd >= REVERSE_GLITCH_DEG:
+                    dd = lim
+            elif d_prev > 0:
+                if dd <= -REVERSE_GLITCH_DEG:
+                    dd = -lim
             if dd >= lim or dd <= -lim:
                 self._glitches += 1
                 self._stale[i] = True
@@ -997,6 +1018,7 @@ class Driver:
                 turns = -turns
             self._delta[i] += turns
             self._has_delta = True
+            self._last_dir[i] = 1 if d > 0 else -1
             self._anchor[i] = ang
         else:
             # Nothing emitted: after a few quiet scans the knob counts as
