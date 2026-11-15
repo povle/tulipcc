@@ -1802,6 +1802,19 @@ class Driver:
 
     # --- NeoPixels (§10.2) ---
 
+    def _anim_fill(self, upto, n):
+        """Light LEDs 0..upto (brighter towards the tip), dark beyond.
+
+        Writes the WHOLE strip so nothing from the previous frame - or from the
+        runtime's parameter levels - can survive behind the animation.
+        """
+        span = upto + 1.0
+        for k in range(n):
+            if k <= upto:
+                self._leds[k] = self._anim_col(0.35 + 0.65 * ((k + 1.0) / span))
+            else:
+                self._leds[k] = self._anim_col(0.0)
+
     def _anim_col(self, level):
         """LED value for a 0..1 brightness, in this strip's channel order."""
         if level < 0.0:
@@ -1827,15 +1840,12 @@ class Driver:
         i = self._anim_i
         if ph == 1:
             if i < n:
-                # Brightness ramps along the strip and each LED keeps a short
-                # trail, so the sweep reads as a smooth run rather than 16
-                # discrete steps.
-                lvl = 0.45 + 0.55 * (i / float(n))
-                self._leds[i] = self._anim_col(lvl)
-                if i >= 1:
-                    self._leds[i - 1] = self._anim_col(lvl * 0.45)
-                if i >= 2:
-                    self._leds[i - 2] = self._anim_col(lvl * 0.15)
+                # FILL, not a dot: every LED up to i is lit, each one brighter
+                # than the last, and everything past i is written DARK. Writing
+                # the whole strip each step is what keeps the patch's parameter
+                # levels out of the background - a partial write left the
+                # untouched LEDs showing whatever they held before.
+                self._anim_fill(i, n)
                 self._leds.write()
                 self._anim_i = i + 1
                 self._anim_next = now + 18
@@ -1848,14 +1858,12 @@ class Driver:
             self._anim_i = 0
             self._anim_next = now
             return
-        # phase 3: sweep out, same trail in reverse
+        # phase 3: sweep out - the same fill, shrinking from the front
         if i < n:
-            self._leds[i] = self._anim_col(0.0)
-            if i >= 1:
-                self._leds[i - 1] = self._anim_col(0.5 * (1.0 - i / float(n)))
+            self._anim_fill(n - 1 - i, n)
             self._leds.write()
             self._anim_i = i + 1
-            self._anim_next = now + 6
+            self._anim_next = now + 8
             return
         self._anim_phase = 0
         # The trail leaves the last couple of LEDs dim: end on a clean black
@@ -1872,6 +1880,8 @@ class Driver:
         """Drive the strip from the pushed levels. Only rewrite on change."""
         if not self._leds:
             return
+        if self._anim_phase:
+            return      # the boot sweep owns the strip until it finishes
         changed = False
         max_l = self._led_max
         for i in range(len(self._leds)):
