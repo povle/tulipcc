@@ -656,19 +656,32 @@ class Driver:
         try:
             import tulip
             from .. import pins as _pins
-        except Exception:
+        except Exception as e:
+            print("cynthia: C pot sweep unavailable (%s), using Python" % e)
             return
         if not hasattr(tulip, "cynthia_pots_init"):
+            print("cynthia: firmware has no C pot sweep, using Python")
             return
         g = _pins.SLOT_GPIOS[self.slot.id]
-        try:
-            # slot 0 -> machine.SPI(0) = SPI2, slot 1 -> SPI3, same as the
-            # Python path (see Slot.spi), so the pins land on the same host.
-            rc = tulip.cynthia_pots_init(self.slot.id + 2, g["A"], g["G"], g["F"],
-                                         g["D"], g["B"], g["C"])
-        except Exception:
-            return
+        # slot 0 -> machine.SPI(0) = SPI2, slot 1 -> SPI3, matching Slot.spi.
+        # If that host is already claimed (a previous start() left a machine.SPI
+        # allocated, or something else grabbed it), try the other one before
+        # giving up - the GPIO matrix lets these pins reach either.
+        rc = None
+        for host in (self.slot.id + 2, 5 - self.slot.id):
+            try:
+                rc = tulip.cynthia_pots_init(host, g["A"], g["G"], g["F"],
+                                             g["D"], g["B"], g["C"])
+            except Exception as e:
+                print("cynthia: C pot sweep init raised %s, using Python" % e)
+                return
+            if rc == 0:
+                break
+            print("cynthia: C pot sweep: SPI%d unavailable (rc=%d)"
+                  % (host, rc))
         if rc != 0:
+            print("cynthia: C pot sweep init failed (rc=%d: -1 host, -2 bus, "
+                  "-3 device), using Python" % rc)
             return
 
         def sweep(addrs=None):
@@ -967,11 +980,7 @@ class Driver:
         if period is None:
             return
         if self._auto_pace:
-            period = int(self._sweep_ms * AUTO_PACE_FACTOR)
-            if period < MIN_SCAN_PERIOD_MS:
-                period = MIN_SCAN_PERIOD_MS
-            elif period > MAX_SCAN_PERIOD_MS:
-                period = MAX_SCAN_PERIOD_MS
+            period = self.effective_period_ms()
         last = self._last_scan_ms
         if last is not None and _ticks_diff(now_ms, last) < period:
             return
@@ -1444,6 +1453,24 @@ class Driver:
     def scan_period(self):
         """Configured period, or None when stopped (see set_scan_period)."""
         return self._scan_period_ms
+
+    def effective_period_ms(self):
+        """The period poll() actually uses right now (auto-pacing applied)."""
+        period = self._scan_period_ms
+        if period is None or not self._auto_pace:
+            return period
+        period = int(self._sweep_ms * AUTO_PACE_FACTOR)
+        if period < MIN_SCAN_PERIOD_MS:
+            period = MIN_SCAN_PERIOD_MS
+        elif period > MAX_SCAN_PERIOD_MS:
+            period = MAX_SCAN_PERIOD_MS
+        return period
+
+    def sweep_mode(self):
+        """'c', 'python' or None (stopped) - which bus path is in use."""
+        if self._scan_period_ms is None:
+            return None
+        return "c" if self._c_sweep is not None else "python"
 
     def sweep_ms(self):
         """Measured cost of the last scan, ms. Auto-pacing is 2x this."""

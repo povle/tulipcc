@@ -137,10 +137,13 @@ def pots_report():
               % (drv.delta_deadband(),
                  drv.deadband_moving() if hasattr(drv, "deadband_moving") else 0.0))
     if hasattr(drv, "sweep_ms"):
-        period = drv.scan_period()
-        print("scan: %.2f ms measured, period %s%s"
+        period = (drv.effective_period_ms() if hasattr(drv, "effective_period_ms")
+                  else drv.scan_period())
+        mode = drv.sweep_mode() if hasattr(drv, "sweep_mode") else "?"
+        print("scan: %.2f ms measured, period %s, bus %s%s"
               % (drv.sweep_ms(),
                  "stopped" if period is None else "%d ms" % period,
+                 "C" if mode == "c" else ("Python" if mode == "python" else mode),
                  " (auto 2x)" if getattr(drv, "auto_pace", lambda: False)() else ""))
     if hasattr(drv, "timing"):
         baud, settle = drv.timing()
