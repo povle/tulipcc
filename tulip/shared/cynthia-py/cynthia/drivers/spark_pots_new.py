@@ -1588,6 +1588,18 @@ class Driver:
             return None
         return "c" if self._c_sweep is not None else "python"
 
+    def reset_travel(self):
+        """Zero the travel/emitted/resync counters (see travel_report).
+
+        Clear, turn the knob one way for a known amount, report: that is the only
+        way to compare a slow turn against a fast one, because the counters
+        otherwise accumulate across both.
+        """
+        for i in range(NUM_POTS):
+            self._travel_deg[i] = 0.0
+            self._emit_deg[i] = 0.0
+            self._resyncs[i] = 0
+
     def travel_report(self, min_deg=20.0):
         """Per-pot 'knob travel vs emitted movement' lines.
 

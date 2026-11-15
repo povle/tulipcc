@@ -168,6 +168,18 @@ def pots_report():
         print("glitches: %d" % drv.glitch_count())
 
 
+def reset_pot_travel():
+    """Zero the per-pot travel/emitted counters, then turn the knob and read
+    pots_report(): that compares slow vs fast turns on equal footing."""
+    from . import registry
+    for d in registry.drivers().values():
+        if hasattr(d, "reset_travel"):
+            d.reset_travel()
+            print("cynthia: pot travel counters cleared")
+            return
+    print("cynthia: no pot board with travel counters")
+
+
 def set_pot_deadband(deg):
     """Tune rotation hysteresis at runtime (higher = more noise immunity)."""
     from . import registry
