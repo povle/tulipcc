@@ -252,12 +252,19 @@ LED_TIMING = (300, 900, 600, 600)
 # It is, however, pure lag while the knob IS moving: a hand at a comfortable
 # 120 deg/s crosses 7 deg in 58ms, so the parameter advanced only every second
 # or third scan and stepped instead of following the hand (reported as
-# "choppy"). Once a turn is under way, noise is no longer what limits us - the
-# median-of-3 and the direction continuity are - so the bar drops to
-# DELTA_DEADBAND_MOVING_DEG until the knob has been quiet for MOVING_HOLD_SCANS.
+# "choppy"). So the bar drops to DELTA_DEADBAND_MOVING_DEG once a turn is under
+# way, until the knob has been quiet for MOVING_HOLD_SCANS.
 # Tunable at runtime with rt.set_pot_deadband_moving().
+#
+# It must stay ABOVE the noise, though. 2 deg was tried on the theory that noise
+# no longer matters while moving - it does: the +-3.3 deg noise ADDS to the real
+# movement, and a sub-noise bar emits the noise as movement, so a SLOW turn
+# gained rotation (fewer degrees for a full parameter sweep) while a fast one
+# did not, because there the real movement swamps it. Measured: 2 deg gave 58%
+# emitted-per-travel on a slow turn against 93% on a fast one. 4 deg is above
+# the noise and still half the lag of the still bar.
 DELTA_DEADBAND_DEG = 5.0
-DELTA_DEADBAND_MOVING_DEG = 2.0
+DELTA_DEADBAND_MOVING_DEG = 4.0
 MOVING_HOLD_SCANS = 4
 
 # Rotation per scan that no hand can produce: 90 deg in a 20ms scan is 12.5
@@ -1021,7 +1028,7 @@ class Driver:
             d -= 360.0
         elif d < -180.0:
             d += 360.0
-        self._travel_deg[i] += d if d > 0.0 else -d
+        self._travel_deg[i] += d
         # Remember the sub-deadband rotation: the LED shows it so the strip
         # tracks the hand continuously, while the PARAMETER keeps its 7 degree
         # hysteresis (that hysteresis is what stops noise accumulating).
@@ -1606,15 +1613,20 @@ class Driver:
         Conservation check: emitted should track travel 1:1. A ratio well under
         100% means movement was dropped, and the resync count says whether a
         thrown-away sample is where it went.
+
+        `travel` is the NET angle change (summed with sign, so symmetric noise
+        cancels) - summing |d| counted every noise excursion as travel and made a
+        slow turn look like it lost half its movement.
         """
         out = []
         for i in range(NUM_POTS):
             t = self._travel_deg[i]
-            if t < min_deg:
+            if (t if t >= 0.0 else -t) < min_deg:
                 continue
             e = self._emit_deg[i]
-            out.append("P%02d travel %.0f deg, emitted %.0f (%.0f%%), resyncs %d"
-                       % (i + 1, t, e, 100.0 * e / t if t else 0.0, self._resyncs[i]))
+            out.append("P%02d travel %+.0f deg, emitted %.0f (%.0f%%), resyncs %d"
+                       % (i + 1, t, e, 100.0 * e / (t if t > 0.0 else -t) if t else 0.0,
+                          self._resyncs[i]))
         return out
 
     def hot_pots(self):
