@@ -627,3 +627,35 @@ overhead (the numbers above). The period therefore stays 33ms: 20ms would be
 ~59% of the CPU on top of the UI poll's ~44%. Raising the *rate* from here
 needs the sweep in C (the same primitives at hardware speed are ~3.5ms),
 not a shorter period or a subset of addresses.
+
+## Turning left, the parameter landing to the RIGHT: the wiper source flipping
+
+Reported: "if a param is at 50% and I turn rapidly left to get to 0, sometimes it
+lands at 60% instead" — movement against the hand, which no deadband or rate
+change can explain.
+
+The angle comes from two wipers 180 deg apart, each covering 340 deg. While both
+are alive and agree within AVG_DEG they are averaged; when they disagree (one is
+compressed near ITS end of travel and reads wrong by tens of degrees) the code
+picks "the wiper further from its own end". That choice is a *per-scan*
+decision, and which wiper is further from its end CROSSES OVER as the knob
+turns - so the source flipped, and each flip stepped the angle by the wiper
+error (~15 deg measured in the harness). With the moving deadband at 2 deg and
+the time-scaled glitch bar, that step was accepted as real parameter movement.
+A rapid turn therefore accumulated a step against its direction and could end up
+the wrong side of where it started.
+
+Two changes:
+- `_compute_angle_ex(raw0, raw1, prefer)` returns WHICH wiper produced the angle
+  (None when averaged) and honours `prefer` - the wiper used last scan - while it
+  is still alive. The source no longer flips while both are usable.
+  `_compute_angle` stays pure (it is the scope/self-test entry point).
+- `_update_pot` treats a wiper->wiper flip as a RESYNC: the new angle becomes the
+  reference with no delta emitted, so even a genuine switch cannot move the
+  parameter.
+
+Harness: a 15 deg wiper error across the crossover now tracks monotonically with
+0 reverse steps; the same sample with no preference still picks the wrong wiper
+(255.1 deg) where the hysteresis keeps the right one (269.9 deg). If a wrong-way
+step survives this, `rt.pot_debug(0)` prints used0/used1, pair errors, glitches
+and the chosen source per pot - that says which branch fired.

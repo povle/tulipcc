@@ -369,6 +369,9 @@ class Driver:
             self._deadband_moving = DELTA_DEADBAND_MOVING_DEG
         self._moving = [False] * NUM_POTS
         self._idle = [0] * NUM_POTS
+        # Which wiper produced the angle last scan (None = they were averaged),
+        # so the source does not flip between scans across a compressed wiper.
+        self._src = [None] * NUM_POTS
         # Time since the previous scan, for the time-scaled glitch guard.
         self._dt_ms = SCAN_PERIOD_MS
         self._led_max = float(cfg_entry.get("led_brightness", LED_WHITE_MAX))
@@ -528,6 +531,20 @@ class Driver:
     # --- angle math (ported from computeAngle) ---
 
     def _compute_angle(self, raw0, raw1):
+        """Angle only; see _compute_angle_ex. Kept pure for the scope/self-test
+        callers, which must not disturb the driver's source hysteresis."""
+        return self._compute_angle_ex(raw0, raw1)[0]
+
+    def _compute_angle_ex(self, raw0, raw1, prefer=None):
+        """Angle, and WHICH wiper produced it (None when they were averaged).
+
+        `prefer` is the wiper used last scan. While it is still alive and the
+        two disagree, keep using it: the disagreement means one wiper is
+        compressed near its own end, and which one looks "safer" flips between
+        scans as the knob moves - each flip steps the angle by tens of degrees.
+        `_update_pot` turns such a step into a resync instead of a delta, but
+        not flipping at all is better.
+        """
         ang0 = (raw0 / 1023.0) * WIPER_RANGE_DEG           # 0..340
         ang1 = (raw1 / 1023.0) * WIPER_RANGE_DEG + 180.0   # 180..520
         if ang1 >= 360.0:
@@ -546,21 +563,25 @@ class Driver:
 
         if alive0 and alive1:
             if diff > MISPAIR_DEG or diff < -MISPAIR_DEG:
-                return None                     # different sensors: reject
+                return None, None               # different sensors: reject
             if diff < AVG_DEG and diff > -AVG_DEG:
-                return ang0 + diff * 0.5        # both good: average halves noise
+                return ang0 + diff * 0.5, None  # both good: average halves noise
             # Loose agreement: one wiper is compressed near ITS end of travel
-            # and its estimate is the wrong one. Use the wiper that is further
-            # from its own end - never the other way round, because letting the
-            # compressed wiper veto its partner is what killed an arc of the
-            # turn.
-            return ang0 if d0 > d1 else ang1
+            # and its estimate is the wrong one. Prefer the wiper we were
+            # already using; otherwise take the one further from its own end -
+            # never the other way round, because letting the compressed wiper
+            # veto its partner is what killed an arc of the turn.
+            if prefer == 0:
+                return ang0, 0
+            if prefer == 1:
+                return ang1, 1
+            return (ang0, 0) if d0 > d1 else (ang1, 1)
 
         if alive0:
-            return ang0
+            return ang0, 0
         if alive1:
-            return ang1
-        return None
+            return ang1, 1
+        return None, None
 
     # --- scan ---
 
@@ -723,8 +744,19 @@ class Driver:
         self._r1p2[i] = self._r1p1[i]
         self._r1p1[i] = r1
 
-        ang = self._compute_angle(m0, m1)
+        ang, src = self._compute_angle_ex(m0, m1, self._src[i])
         resync = False
+        if ang is not None:
+            prev_src = self._src[i]
+            self._src[i] = src
+            if prev_src is not None and src is not None and src != prev_src:
+                # The source wiper flipped. Where the two disagree their
+                # estimates differ by tens of degrees, so the angle steps - and
+                # with the moving deadband at 2 deg that step was emitted as
+                # real parameter movement, so a rapid turn could read as the
+                # knob going BACKWARDS (turn left from 50%, land on 60%). Take
+                # the new angle as the reference without emitting it.
+                resync = True
         if ang is None:
             # Pair rejected: hold the last good angle so the knob does not
             # jump, and count it. A climbing count for one pot is a hardware
@@ -732,6 +764,11 @@ class Driver:
             self._pair_err[i] += 1
             self._stale[i] = True
             ang = self.values[i] * 360.0
+        elif resync:
+            # Source flip: re-seed from this sample, no delta for the step.
+            self._stale[i] = False
+            self._used0[i] = m0
+            self._used1[i] = m1
         elif self._stale[i]:
             # RECOVERING from a bad stretch. Do not treat the catch-up as a
             # glitch: holding here left the anchor behind, so every later
