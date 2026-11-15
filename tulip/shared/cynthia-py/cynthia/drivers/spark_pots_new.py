@@ -569,6 +569,11 @@ class Driver:
             off = (0, 0, 0, 0) if self._led_bpp >= 4 else (0, 0, 0)
             for i in range(len(self._leds)):
                 self._leds[i] = off
+            # Twice, with a gap: a frame sent while the strip's 5V rail is still
+            # ramping is dropped, and the strip keeps displaying the LAST frame
+            # of the previous power cycle until a good one arrives.
+            self._leds.write()
+            time.sleep_ms(30)
             self._leds.write()
             if self.cfg.get("boot_animation", True):
                 w = int(self._led_max * 255.0 + 0.5)
@@ -1797,6 +1802,15 @@ class Driver:
 
     # --- NeoPixels (§10.2) ---
 
+    def _anim_col(self, level):
+        """LED value for a 0..1 brightness, in this strip's channel order."""
+        if level < 0.0:
+            level = 0.0
+        elif level > 1.0:
+            level = 1.0
+        w = int(self._led_max * level * 255.0 + 0.5)
+        return (0, 0, 0, w) if self._led_bpp >= 4 else (w, w, w)
+
     def _boot_tick(self, now):
         """Advance the boot LED sweep by one step. Never blocks.
 
@@ -1813,27 +1827,42 @@ class Driver:
         i = self._anim_i
         if ph == 1:
             if i < n:
-                self._leds[i] = self._anim_on
+                # Brightness ramps along the strip and each LED keeps a short
+                # trail, so the sweep reads as a smooth run rather than 16
+                # discrete steps.
+                lvl = 0.45 + 0.55 * (i / float(n))
+                self._leds[i] = self._anim_col(lvl)
+                if i >= 1:
+                    self._leds[i - 1] = self._anim_col(lvl * 0.45)
+                if i >= 2:
+                    self._leds[i - 2] = self._anim_col(lvl * 0.15)
                 self._leds.write()
                 self._anim_i = i + 1
-                self._anim_next = now + 22
+                self._anim_next = now + 18
             else:
                 self._anim_phase = 2
-                self._anim_next = now + 70
+                self._anim_next = now + 80
             return
         if ph == 2:
             self._anim_phase = 3
             self._anim_i = 0
             self._anim_next = now
             return
-        # phase 3: sweep out
+        # phase 3: sweep out, same trail in reverse
         if i < n:
-            self._leds[i] = self._anim_off
+            self._leds[i] = self._anim_col(0.0)
+            if i >= 1:
+                self._leds[i - 1] = self._anim_col(0.5 * (1.0 - i / float(n)))
             self._leds.write()
             self._anim_i = i + 1
             self._anim_next = now + 6
             return
         self._anim_phase = 0
+        # The trail leaves the last couple of LEDs dim: end on a clean black
+        # frame so the strip is genuinely dark when the parameters take over.
+        for k in range(n):
+            self._leds[k] = self._anim_col(0.0)
+        self._leds.write()
         # Forget what the strip was told: the first real update must rewrite
         # every LED instead of assuming the animation left it dark.
         for k in range(NUM_POTS):
