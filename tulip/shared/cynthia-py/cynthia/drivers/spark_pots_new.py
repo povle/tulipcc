@@ -193,6 +193,17 @@ SCAN_PERIOD_MS = 33
 AUTO_PACE_FACTOR = 2.0
 MIN_SCAN_PERIOD_MS = 8
 MAX_SCAN_PERIOD_MS = 50
+
+# Hot-pot polling. A full sweep costs ~7ms because it visits all 16 addresses;
+# polling ONE pot costs ~0.4ms because it seeks to just its two addresses. So a
+# pot that is being turned does not have to share the budget with 15 still ones:
+# while any pot is hot, poll those at HOT_SCAN_PERIOD_MS and sweep everything
+# else at IDLE_SCAN_PERIOD_MS. A still pot cannot be missed at the slower rate -
+# the deadband means nothing happens until it moves - and the 40ms sweep is what
+# notices it starting to.
+HOT_MS = 250                  # how long a pot stays hot after its last movement
+HOT_SCAN_PERIOD_MS = 3        # ~330Hz for the pot in your hand
+IDLE_SCAN_PERIOD_MS = 40      # full sweep cadence while something is hot
 # Brightness ceiling for the per-pot LEDs, 0..1 of full white.
 #
 # One SK6812 at 5V full white draws ~60mA (three dies) or ~20mA on its W die, so
@@ -405,6 +416,10 @@ class Driver:
         self._idle = [0] * NUM_POTS
         # +1/-1: the direction of the last emitted delta, for the reverse guard.
         self._last_dir = [0] * NUM_POTS
+        # Per-pot "hot until" ticks (see HOT_MS) and the hot-poll pacing state.
+        self._hot_until = [0] * NUM_POTS
+        self._hot_ms = 0
+        self._hot_rot = 0
         # Which wiper produced the angle last scan (None = they were averaged),
         # so the source does not flip between scans across a compressed wiper.
         self._src = [None] * NUM_POTS
@@ -1019,6 +1034,7 @@ class Driver:
             self._delta[i] += turns
             self._has_delta = True
             self._last_dir[i] = 1 if d > 0 else -1
+            self._hot_until[i] = time.ticks_ms() + HOT_MS
             self._anchor[i] = ang
         else:
             # Nothing emitted: after a few quiet scans the knob counts as
@@ -1040,13 +1056,37 @@ class Driver:
         than ~50Hz. Pace it so a scan costs at most a fraction of the budget.
         """
         if now_ms is None:
-            import time
             now_ms = time.ticks_ms()
         period = self._scan_period_ms
         if period is None:
             return
         if self._auto_pace:
             period = self.effective_period_ms()
+
+        # Any hot pot? Then the budget goes to it and the full sweep drops to
+        # the idle cadence (it is only there to notice the NEXT pot moving).
+        hot = None
+        for k in range(NUM_POTS):
+            i = (self._hot_rot + k) % NUM_POTS
+            if self._hot_until[i] and _ticks_diff(self._hot_until[i], now_ms) > 0:
+                hot = i
+                break
+        if hot is not None:
+            if _ticks_diff(now_ms, self._hot_ms) >= HOT_SCAN_PERIOD_MS:
+                self._hot_ms = now_ms
+                self._hot_rot = (hot + 1) % NUM_POTS
+                self._scan_one(hot)
+                t_led = time.ticks_us()
+                if self._leds and self._led_mode != "manual":
+                    self._update_leds()
+                self._leds_ms = time.ticks_diff(time.ticks_us(), t_led) / 1000.0
+            last = self._last_scan_ms
+            if last is not None and _ticks_diff(now_ms, last) < IDLE_SCAN_PERIOD_MS:
+                return
+            self._last_scan_ms = now_ms
+            self.scan()
+            return
+
         last = self._last_scan_ms
         if last is not None and _ticks_diff(now_ms, last) < period:
             return
@@ -1537,6 +1577,15 @@ class Driver:
         if self._scan_period_ms is None:
             return None
         return "c" if self._c_sweep is not None else "python"
+
+    def hot_pots(self):
+        """Pot indices currently being polled at the fast cadence."""
+        now = time.ticks_ms()
+        out = []
+        for i in range(NUM_POTS):
+            if self._hot_until[i] and _ticks_diff(self._hot_until[i], now) > 0:
+                out.append(i)
+        return out
 
     def sweep_ms(self):
         """Measured cost of the last scan, ms. Auto-pacing is 2x this."""

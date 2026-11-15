@@ -148,6 +148,10 @@ def pots_report():
         if hasattr(drv, "sweep_breakdown"):
             r, u, l = drv.sweep_breakdown()
             print("      bus %.2f ms + maths %.2f ms + leds %.2f ms" % (r, u, l))
+        if hasattr(drv, "hot_pots"):
+            hot = drv.hot_pots()
+            print("      hot: %s" % (", ".join("P%02d" % (i + 1) for i in hot)
+                                     if hot else "none (idle sweep)"))
     if hasattr(drv, "timing"):
         baud, settle = drv.timing()
         print("spi: %d Hz   mux settle: %d us" % (baud, settle))
