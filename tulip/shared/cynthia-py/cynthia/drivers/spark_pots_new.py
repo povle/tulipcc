@@ -290,6 +290,14 @@ GLITCH_DEG_PER_S = 3000.0   # 8.3 turns/second, beyond any hand
 # - which is how a rapid turn still ended up going the wrong way.
 REVERSE_GLITCH_DEG = 30.0
 
+# Deadband applied to movement AGAINST the last emitted direction. Noise is
+# symmetric, so on a very fast turn (6 deg per 3ms poll) a +-3.3 deg excursion
+# can sum with the noise to cross a 4 deg bar the wrong way and show as a tiny
+# inversion. Requiring 12 deg to reverse cannot be reached by noise, and a real
+# reversal accumulates that within a few polls (3ms each), so it costs a few
+# milliseconds and nothing else.
+REVERSE_DEADBAND_DEG = 12.0
+
 
 def _median3(a, b, c):
     """Median of three, tolerating missing history (None -> return c).
@@ -1036,6 +1044,12 @@ class Driver:
         # reject noise on a still knob, and on a moving one it is just lag (see
         # DELTA_DEADBAND_MOVING_DEG).
         db = self._deadband_moving if self._moving[i] else self._deadband
+        # Reversing has to clear a higher bar than continuing (see
+        # REVERSE_DEADBAND_DEG): this is what stops noise on a very fast turn
+        # from emitting as a small inversion.
+        prev_dir = self._last_dir[i]
+        if (prev_dir > 0 and d < 0.0) or (prev_dir < 0 and d > 0.0):
+            db = REVERSE_DEADBAND_DEG
         self._resid[i] = 0.0 if (d >= db or d <= -db) else d / 360.0
         if d >= db or d <= -db:
             self._moving[i] = True
