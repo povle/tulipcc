@@ -205,8 +205,14 @@ LED_TIMING = (300, 900, 600, 600)
 # tracking a 90-degree turn to within 0.001 turns. Lower this
 # (rt.set_pot_deadband) once the panel is reflowed if the signal is clean -
 # every degree here is one degree of end-of-turn lag.
-# 7 deg is the STILL-knob bar and has to stay: 5 deg was measured to sit inside
-# the +-3.3 deg noise and emitted spurious deltas while nothing was touched.
+# 7 deg was the bar chosen when 5 deg was measured to sit inside the +-3.3 deg
+# noise and emitted spurious deltas with nothing touched. That measurement is
+# STALE: it predates the median-of-3 filter, the widened wiper deadzone and the
+# read-repair/mispair work, after which the panel reports the signal as much
+# steadier. 5 deg is the new still bar, which needs the untouched signal under
+# ~2.5 deg peak-to-peak: the harness shows +-3.3 deg (the OLD measured noise)
+# still leaks through 5 and through 4. If the knobs drift untouched, raise it
+# with rt.set_pot_deadband(); if they are rock steady, 4 works.
 #
 # It is, however, pure lag while the knob IS moving: a hand at a comfortable
 # 120 deg/s crosses 7 deg in 58ms, so the parameter advanced only every second
@@ -214,8 +220,9 @@ LED_TIMING = (300, 900, 600, 600)
 # "choppy"). Once a turn is under way, noise is no longer what limits us - the
 # median-of-3 and the direction continuity are - so the bar drops to
 # DELTA_DEADBAND_MOVING_DEG until the knob has been quiet for MOVING_HOLD_SCANS.
-DELTA_DEADBAND_DEG = 7.0
-DELTA_DEADBAND_MOVING_DEG = 3.0
+# Tunable at runtime with rt.set_pot_deadband_moving().
+DELTA_DEADBAND_DEG = 5.0
+DELTA_DEADBAND_MOVING_DEG = 2.0
 MOVING_HOLD_SCANS = 4
 
 # Rotation per scan that no hand can produce: 90 deg in a 20ms scan is 12.5
@@ -1364,6 +1371,18 @@ class Driver:
 
     def delta_deadband(self):
         return self._deadband
+
+    def set_deadband_moving(self, deg):
+        """Change the while-turning hysteresis at runtime (diagnostic aid).
+
+        This is the bar that sets how closely the parameter follows the hand;
+        the still bar only guards against noise. 1-2 deg is the useful range.
+        """
+        self._deadband_moving = float(deg)
+        return self._deadband_moving
+
+    def deadband_moving(self):
+        return self._deadband_moving
 
     def glitch_count(self):
         """Samples rejected as impossible movement (see GLITCH_DEG)."""

@@ -157,6 +157,17 @@ def set_pot_deadband(deg):
     print("cynthia: no pot board with a deadband")
 
 
+def set_pot_deadband_moving(deg):
+    """Tune the while-turning hysteresis (lower = follows the hand closer)."""
+    from . import registry
+    for d in registry.drivers().values():
+        if hasattr(d, "set_deadband_moving"):
+            print("cynthia: pot moving deadband now %.1f deg"
+                  % d.set_deadband_moving(deg))
+            return
+    print("cynthia: no pot board with a moving deadband")
+
+
 def pot_glitches():
     """Count of samples rejected as impossible rotation (see GLITCH_DEG).
 

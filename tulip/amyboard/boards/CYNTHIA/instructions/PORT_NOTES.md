@@ -603,13 +603,16 @@ scaled by the measured time since the last sample (GLITCH_DEG_PER_S = 3000,
 8.3 turns/s) with the old 90 deg as a floor, so the guard rejects a genuine
 180 deg wiper flip at any interval but never eats real motion.
 
-**The chop.** The 7 deg deadband is the *still-knob* noise bar and cannot be
-lowered — 5 deg was measured to sit inside the +-3.3 deg noise and emitted
-spurious deltas with nothing touched. But on a moving knob it is pure lag: at
-120 deg/s a hand crosses 7 deg in 58ms, so the parameter advanced every second
-or third scan instead of following. The bar is now adaptive: 7 deg until a turn
-is under way, then 3 deg while it is, reverting after MOVING_HOLD_SCANS quiet
-scans. The median filter and the direction continuity are what keep the narrow
+**The chop.** The 7 deg deadband is the *still-knob* noise bar: 5 deg once sat
+inside the +-3.3 deg noise and emitted spurious deltas with nothing touched -
+but that measurement PREDATES the median-of-3 filter, the widened wiper deadzone
+and the read-repair/mispair work, and the panel reports the signal as much
+steadier since. So the still bar is now 4 deg. On a moving knob any bar is pure
+lag: at 120 deg/s a hand crosses 7 deg in 58ms, so the parameter advanced every
+second or third scan instead of following. The bar is adaptive: 4 deg until a
+turn is under way, then 2 deg while it is, reverting after MOVING_HOLD_SCANS
+quiet scans. Both are runtime-tunable - rt.set_pot_deadband(deg) and
+rt.set_pot_deadband_moving(deg) - so the panel can be tuned without a flash. The median filter and the direction continuity are what keep the narrow
 bar honest while moving; the still-knob noise test is unchanged.
 
 Verified on the host harness against the real driver class (stubbed machine +
