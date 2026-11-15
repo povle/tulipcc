@@ -459,6 +459,13 @@ _dirty = True
 # readout drifts, and it is the only such value in the header. Repaint on a slow
 # timer so it stays honest without the old 10Hz churn.
 _REFRESH_MS = 2000       # full repaint at least this often (0 disables)
+# Minimum gap between repaints. A frame is ~23ms of BLOCKING I2C (1KB to the
+# SH1106 at 400kHz), and while a knob is moving the screen is dirty on every
+# tick - so painting each time made the display push set the pace for
+# everything: parameters, LEDs and the pot scan all ride the same loop, which is
+# why all three felt equally laggy. The screen does not need 70Hz; the controls
+# do. Dirty state is kept, so the frame is still drawn on the next eligible tick.
+_PAINT_MIN_MS = 33
 _last_paint_ms = 0
 
 _engine = None          # the loaded instrument engine (cynthia_instrument())
@@ -1337,7 +1344,8 @@ def _poll_body(tick):
     _poll_notices(now)
 
     _tick += 1
-    if _dirty or (_REFRESH_MS and time.ticks_diff(now, _last_paint_ms) >= _REFRESH_MS):
+    if (_dirty or (_REFRESH_MS and time.ticks_diff(now, _last_paint_ms) >= _REFRESH_MS)) \
+            and time.ticks_diff(now, _last_paint_ms) >= _PAINT_MIN_MS:
         if _PROFILE:
             t0 = time.ticks_us()
             _d = surface.display()
