@@ -201,6 +201,10 @@ MAX_SCAN_PERIOD_MS = 50
 # else at IDLE_SCAN_PERIOD_MS. A still pot cannot be missed at the slower rate -
 # the deadband means nothing happens until it moves - and the 40ms sweep is what
 # notices it starting to.
+# How long the boot sweep holds at full brightness before the parameters take
+# the strip over. Long enough to read as "it is up", short enough not to delay
+# anything visible.
+BOOT_HOLD_MS = 700
 HOT_MS = 250                  # how long a pot stays hot after its last movement
 # 2ms, not 3: a single-pot poll costs ~0.4ms, so this is ~20% of the thread, and
 # the point is SAMPLES PER DEGREE. The angle noise is per sample, so more samples
@@ -1851,30 +1855,21 @@ class Driver:
                 self._anim_next = now + 18
             else:
                 self._anim_phase = 2
-                self._anim_next = now + 80
+                self._anim_next = now + BOOT_HOLD_MS
             return
         if ph == 2:
-            self._anim_phase = 3
-            self._anim_i = 0
-            self._anim_next = now
-            return
-        # phase 3: sweep out - the same fill, shrinking from the front
-        if i < n:
-            self._anim_fill(n - 1 - i, n)
-            self._leds.write()
-            self._anim_i = i + 1
-            self._anim_next = now + 8
+            # Filled: HOLD at full until the boot is far enough along for the
+            # parameters to take the strip over. No sweep-out - the line stays
+            # lit, then hands over.
+            if _ticks_diff(self._anim_next, now) > 0:
+                return
+            self._anim_phase = 0
+            # Forget what the strip was told: the first real update must rewrite
+            # every LED instead of assuming the animation left it dark.
+            for k in range(NUM_POTS):
+                self._led_byte[k] = None
             return
         self._anim_phase = 0
-        # The trail leaves the last couple of LEDs dim: end on a clean black
-        # frame so the strip is genuinely dark when the parameters take over.
-        for k in range(n):
-            self._leds[k] = self._anim_col(0.0)
-        self._leds.write()
-        # Forget what the strip was told: the first real update must rewrite
-        # every LED instead of assuming the animation left it dark.
-        for k in range(NUM_POTS):
-            self._led_byte[k] = None
 
     def _update_leds(self):
         """Drive the strip from the pushed levels. Only rewrite on change."""
