@@ -82,7 +82,10 @@ static uint16_t pots_convert(int channel, int settle_us) {
 
     gpio_set_level(pots_cs, 0);
     t.rx_buffer = rx;
-    spi_device_transmit(pots_spi, &t);
+    // Polling transmit, not spi_device_transmit: the queued API takes a mutex
+    // and goes through the queue for every 2-byte transfer, and at 64 of them
+    // per sweep that overhead was as much as the transfers themselves.
+    spi_device_polling_transmit(pots_spi, &t);
     gpio_set_level(pots_cs, 1);
     if (settle_us > 0) {
         esp_rom_delay_us(settle_us);
@@ -90,7 +93,7 @@ static uint16_t pots_convert(int channel, int settle_us) {
     rx[0] = 0;
     rx[1] = 0;
     gpio_set_level(pots_cs, 0);
-    spi_device_transmit(pots_spi, &t);
+    spi_device_polling_transmit(pots_spi, &t);
     gpio_set_level(pots_cs, 1);
     return (uint16_t)(((rx[0] & 0x03) << 8) | rx[1]);
 }

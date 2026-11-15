@@ -147,14 +147,21 @@ SETTLE_SANE_US = 5000
 VERIFY_TOL_RAW = 30
 VERIFY_BAD_MAX = 1
 # Mux/counter settle times (from the prototype).
-MUX_SETTLE_US = 100
+# Mux/analog settle after the counter moves. 74HC4051-class propagation is
+# ~100ns and the source RC ~0.2us, so 100us was ~300x margin; 25us is still ~80x
+# and saves 1.2ms across the 16 addresses.
+MUX_SETTLE_US = 25
 
 # How many of the 16 sensors must show a sane wiper pair on the C sweep's first
 # run before the driver trusts it. A wrong SPI mode or pin mapping gives garbage
 # everywhere; pots parked at a rail legitimately fail, so this is deliberately
 # loose - it is a "did the bus come up" check, not a health check.
 C_SWEEP_MIN_VALID = 8
-ADC_SETTLE_US = 20
+# Time between the dummy and the real conversion. The dummy exists because the
+# MCP3002's sample cap holds the PREVIOUS channel's voltage; the cap is ~20pF and
+# the pot source ~10k, so it recharges in ~0.2us. 20us was 100x margin; 5us is
+# still 25x and the dummy itself is a full conversion of settling.
+ADC_SETTLE_US = 5
 
 # Minimum gap between full scans, MEASURED rather than assumed.
 #
@@ -766,9 +773,24 @@ class Driver:
         return t0 or t1
 
     def _bad_pair_count(self):
+        """How many sensors' two wipers disagree (the slip/crosstalk gate).
+
+        Only sensors whose raw counts CHANGED since the previous sweep are
+        checked. An address slip shifts what every touched address holds, so a
+        slipped pot always reads differently - a still pot cannot have become a
+        different sensor without its counts moving. With 16 pots that turns ~320
+        VM operations per scan into ~50 on an untouched panel, which was ~2ms of
+        the scan for no information.
+        """
         n = 0
+        p0 = self._r0p1
+        p1 = self._r1p1
         for i in range(NUM_POTS):
-            if not self._pair_ok(self._phase0[i], self._phase1[i]):
+            r0 = self._phase0[i]
+            r1 = self._phase1[i]
+            if r0 == p0[i] and r1 == p1[i]:
+                continue
+            if not self._pair_ok(r0, r1):
                 n += 1
         return n
 
