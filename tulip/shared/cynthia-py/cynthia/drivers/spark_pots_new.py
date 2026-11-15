@@ -148,6 +148,12 @@ VERIFY_TOL_RAW = 30
 VERIFY_BAD_MAX = 1
 # Mux/counter settle times (from the prototype).
 MUX_SETTLE_US = 100
+
+# How many of the 16 sensors must show a sane wiper pair on the C sweep's first
+# run before the driver trusts it. A wrong SPI mode or pin mapping gives garbage
+# everywhere; pots parked at a rail legitimately fail, so this is deliberately
+# loose - it is a "did the bus come up" check, not a health check.
+C_SWEEP_MIN_VALID = 8
 ADC_SETTLE_US = 20
 
 # Minimum gap between full scans, MEASURED rather than assumed.
@@ -310,6 +316,8 @@ class Driver:
         # Pre-allocated scan state (zero-alloc, §8).
         self._phase0 = [0] * NUM_POTS
         self._phase1 = [0] * NUM_POTS
+        # Every counter address, ascending (the C sweep wants them in order).
+        self._all_addrs = list(range(NUM_POTS))
         self._tx = bytearray(2)
         self._rx = bytearray(2)
         self._drx = bytearray(2)
@@ -437,8 +445,22 @@ class Driver:
             self._spi_baud = int(self.cfg.get("spi_baudrate", 1000000))
         except (TypeError, ValueError):
             self._spi_baud = 1000000
-        self._spi = self.slot.spi(sck="D", mosi="B", miso="C", baudrate=self._spi_baud)
-        self._reset_counter()
+        # Fast path first: the C sweep (boards/CYNTHIA/cynthia_pots.c). Measured
+        # on the panel, the Python sweep is 17.2ms - ~560 VM operations at ~17us
+        # each, of which only ~1ms is SPI wire time - and because it shares a
+        # thread with the UI draw that caps the whole control loop near 30Hz.
+        # The C does the same protocol in ~3ms.
+        #
+        # It CLAIMS the SPI host, so machine.SPI must not be created while it is
+        # up. The first sweep is validated before we commit: a wrong mode or pin
+        # produces garbage that would otherwise look like 16 dead knobs.
+        self._c_sweep = None
+        self._spi = None
+        if self.cfg.get("c_sweep", True):
+            self._start_c_sweep()
+        if self._spi is None and self._c_sweep is None:
+            self._spi = self.slot.spi(sck="D", mosi="B", miso="C", baudrate=self._spi_baud)
+            self._reset_counter()
         time.sleep_ms(10)  # supply ramp for muxes/ADC (from the prototype)
         # The stock new pot board HAS one SK6812 under every pot, so the strip
         # defaults ON. It used to require an "leds" block in
@@ -625,6 +647,58 @@ class Driver:
         if self._leds and self._led_mode != "manual":
             self._update_leds()
 
+    def _start_c_sweep(self):
+        """Claim the SPI host for the C sweep, and prove it works first.
+
+        Leaves self._c_sweep as a callable on success; leaves it None and
+        releases the bus on failure so the caller falls back to Python.
+        """
+        try:
+            import tulip
+            from .. import pins as _pins
+        except Exception:
+            return
+        if not hasattr(tulip, "cynthia_pots_init"):
+            return
+        g = _pins.SLOT_GPIOS[self.slot.id]
+        try:
+            # slot 0 -> machine.SPI(0) = SPI2, slot 1 -> SPI3, same as the
+            # Python path (see Slot.spi), so the pins land on the same host.
+            rc = tulip.cynthia_pots_init(self.slot.id + 2, g["A"], g["G"], g["F"],
+                                         g["D"], g["B"], g["C"])
+        except Exception:
+            return
+        if rc != 0:
+            return
+
+        def sweep(addrs=None):
+            tulip.cynthia_pots_sweep(addrs if addrs is not None else self._all_addrs,
+                                     self._phase0, self._phase1,
+                                     ADC_SETTLE_US, self._mux_settle_us)
+
+        self._c_sweep = sweep
+        ok = 0
+        try:
+            sweep()
+            for i in range(NUM_POTS):
+                if self._pair_ok(self._phase0[i], self._phase1[i]):
+                    ok += 1
+        except Exception:
+            ok = 0
+        if ok >= C_SWEEP_MIN_VALID:
+            # verify_sweep re-reads through the Python bus, which the C now
+            # owns; the pair check in _scan_all still runs on every scan.
+            self._verify = False
+            print("cynthia: pot sweep in C (%d/%d sensors sane)" % (ok, NUM_POTS))
+            return
+        print("cynthia: C pot sweep failed validation (%d/%d), using Python"
+              % (ok, NUM_POTS))
+        self._c_sweep = None
+        try:
+            tulip.cynthia_pots_deinit()
+        except Exception:
+            pass
+
     def _read_all_raw(self, reset=True):
         """One sweep of every address, into _phase0/_phase1. No derived state.
 
@@ -638,6 +712,10 @@ class Driver:
         `reset=False` sweeps from wherever the counter is - used by the
         self-test to build a deliberate offset, never by the scan path.
         """
+        if self._c_sweep is not None:
+            # The C sweep always re-homes the counter, so `reset` is implicit.
+            self._c_sweep()
+            return
         if reset:
             self._reset_counter()  # address 0
         for addr in range(NUM_POTS):
@@ -742,6 +820,11 @@ class Driver:
         channel sees a stable selection instead of a 50Hz sweep. Other pots keep
         their last values.
         """
+        if self._c_sweep is not None:
+            a0, a1 = _ADDR0[n], _ADDR1[n]
+            self._c_sweep([a0, a1] if a0 < a1 else [a1, a0])
+            self._update_pot(n)
+            return
         self._seek(_ADDR0[n])
         self._phase0[n] = self._read_adc(0)
         self._sd0[n] = self._last_delta

@@ -764,6 +764,10 @@ extern int8_t cynthia_get_octave_shift(void);
 extern void cynthia_set_octave_shift(int8_t shift);
 extern bool cynthia_pot_scan_enable(bool on);
 extern bool cynthia_pot_scan_enabled(void);
+extern int cynthia_pots_init(int host, int clk, int rst, int cs, int sck, int mosi, int miso);
+extern void cynthia_pots_deinit(void);
+extern bool cynthia_pots_ready(void);
+extern int cynthia_pots_sweep(const uint8_t *addrs, int n, uint16_t *out0, uint16_t *out1, int settle_us, int mux_settle_us);
 extern uint32_t cynthia_mic_record(uint32_t seconds);
 extern uint32_t cynthia_mic_len(void);
 extern const int16_t *cynthia_mic_ptr(void);
@@ -801,6 +805,10 @@ static inline int8_t cynthia_get_octave_shift(void) { return 0; }
 static inline void cynthia_set_octave_shift(int8_t shift) {}
 static inline bool cynthia_pot_scan_enable(bool on) { (void)on; return false; }
 static inline bool cynthia_pot_scan_enabled(void) { return false; }
+static inline int cynthia_pots_init(int host, int clk, int rst, int cs, int sck, int mosi, int miso) { (void)host; (void)clk; (void)rst; (void)cs; (void)sck; (void)mosi; (void)miso; return -1; }
+static inline void cynthia_pots_deinit(void) {}
+static inline bool cynthia_pots_ready(void) { return false; }
+static inline int cynthia_pots_sweep(const uint8_t *addrs, int n, uint16_t *out0, uint16_t *out1, int settle_us, int mux_settle_us) { (void)addrs; (void)n; (void)out0; (void)out1; (void)settle_us; (void)mux_settle_us; return -1; }
 static inline uint32_t cynthia_mic_record(uint32_t seconds) { (void)seconds; return 0; }
 static inline uint32_t cynthia_mic_len(void) { return 0; }
 static inline const int16_t *cynthia_mic_ptr(void) { return NULL; }
@@ -905,8 +913,67 @@ STATIC mp_obj_t tulip_cynthia_mic_record(mp_obj_t seconds_obj) {
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(tulip_cynthia_mic_record_obj, tulip_cynthia_mic_record);
 
+// Fast pot sweep for the spark-pots mux pair. The Python sweep is ~17ms on the
+// panel (~560 MicroPython operations at ~17us each) and caps the control loop
+// near 30Hz; the same protocol here is ~3ms. The driver keeps all the maths,
+// pair checks and deadbands - only the bus access moves.
+STATIC mp_obj_t tulip_cynthia_pots_init(size_t n_args, const mp_obj_t *args) {
+    int rc = cynthia_pots_init(mp_obj_get_int(args[0]), mp_obj_get_int(args[1]),
+                               mp_obj_get_int(args[2]), mp_obj_get_int(args[3]),
+                               mp_obj_get_int(args[4]), mp_obj_get_int(args[5]),
+                               mp_obj_get_int(args[6]));
+    return mp_obj_new_int(rc);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_pots_init_obj, 7, 7, tulip_cynthia_pots_init);
+
+STATIC mp_obj_t tulip_cynthia_pots_deinit(void) {
+    cynthia_pots_deinit();
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_pots_deinit_obj, tulip_cynthia_pots_deinit);
+
+STATIC mp_obj_t tulip_cynthia_pots_ready(void) {
+    return mp_obj_new_bool(cynthia_pots_ready());
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(tulip_cynthia_pots_ready_obj, tulip_cynthia_pots_ready);
+
+// sweep(addrs, out0, out1, settle_us, mux_settle_us): visits `addrs` in
+// ascending order and writes each one's wipers into out0/out1 BY SENSOR index,
+// so the caller's 16-entry lists stay in pot order. out0/out1 are filled in
+// place - no allocation per scan.
+STATIC mp_obj_t tulip_cynthia_pots_sweep(size_t n_args, const mp_obj_t *args) {
+    size_t na = 0, n0 = 0, n1 = 0;
+    mp_obj_t *addrs, *o0, *o1;
+    uint8_t addr_buf[16];
+    uint16_t raw0[16], raw1[16];
+    size_t i;
+
+    mp_obj_get_array(args[0], &na, &addrs);
+    mp_obj_get_array(args[1], &n0, &o0);
+    mp_obj_get_array(args[2], &n1, &o1);
+    if (na > 16 || n0 < 16 || n1 < 16) {
+        mp_raise_ValueError(MP_ERROR_TEXT("pots_sweep: need <=16 addrs and two 16-item lists"));
+    }
+    for (i = 0; i < na; i++) {
+        addr_buf[i] = (uint8_t)mp_obj_get_int(addrs[i]);
+    }
+    memset(raw0, 0, sizeof(raw0));
+    memset(raw1, 0, sizeof(raw1));
+    int rc = cynthia_pots_sweep(addr_buf, (int)na, raw0, raw1,
+                                mp_obj_get_int(args[3]), mp_obj_get_int(args[4]));
+    if (rc != 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("pots_sweep: SPI not initialised"));
+    }
+    for (i = 0; i < 16; i++) {
+        o0[i] = mp_obj_new_int(raw0[i]);
+        o1[i] = mp_obj_new_int(raw1[i]);
+    }
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(tulip_cynthia_pots_sweep_obj, 5, 5, tulip_cynthia_pots_sweep);
+
 // The captured audio as 16-bit signed little-endian mono, ready to hand
-// straight to amy.load_sample_bytes().
+// straight to amy.load_sample_bytes.
 STATIC mp_obj_t tulip_cynthia_mic_bytes(void) {
     uint32_t n = cynthia_mic_len();
     const int16_t *p = cynthia_mic_ptr();
@@ -2158,6 +2225,10 @@ STATIC const mp_rom_map_elem_t tulip_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_i2c_bg_errors), MP_ROM_PTR(&tulip_i2c_bg_errors_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_knobs), MP_ROM_PTR(&tulip_cynthia_knobs_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_pot_scan), MP_ROM_PTR(&tulip_cynthia_pot_scan_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_pots_init), MP_ROM_PTR(&tulip_cynthia_pots_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_pots_deinit), MP_ROM_PTR(&tulip_cynthia_pots_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_pots_ready), MP_ROM_PTR(&tulip_cynthia_pots_ready_obj) },
+    { MP_ROM_QSTR(MP_QSTR_cynthia_pots_sweep), MP_ROM_PTR(&tulip_cynthia_pots_sweep_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_mic_record), MP_ROM_PTR(&tulip_cynthia_mic_record_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_mic_bytes), MP_ROM_PTR(&tulip_cynthia_mic_bytes_obj) },
     { MP_ROM_QSTR(MP_QSTR_cynthia_mic_info), MP_ROM_PTR(&tulip_cynthia_mic_info_obj) },

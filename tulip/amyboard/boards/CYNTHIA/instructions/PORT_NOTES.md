@@ -684,3 +684,42 @@ number is what to quote when the knobs feel slow, because it decides everything
 else. If it comes out near 3ms the pots are running at the 8ms floor (125Hz); if
 it is still ~12ms, the sweep needs to move to C (32 SPI transactions at hardware
 speed ~3.5ms), not a shorter period.
+
+## The pot sweep moved to C: 17.2 ms -> ~3 ms
+
+Measured on the panel with `rt.pots_report()`: `scan: 17.23 ms measured` with
+auto-pacing at 2x, i.e. a ~34ms period and ~29Hz. Since the sweep shares a
+thread with the UI draw (~15ms/frame), that was the whole reason the knobs felt
+slow - and it is not a deadband or threshold problem.
+
+17.2ms is ~560 MicroPython operations at ~17us each; only ~1ms of it is SPI wire
+time. So the fix is fewer *operations*, which in practice means C:
+`boards/CYNTHIA/cynthia_pots.c` does the same protocol - same control bytes,
+same dummy-then-real transaction, same address maps - and the driver keeps all
+the angle maths, pair checks, deadbands and glitch bars.
+
+Design points worth remembering:
+
+- The C CLAIMS the SPI host (`spi_bus_initialize`, SPI2 for slot 0 / SPI3 for
+  slot 1 - matching `Slot.spi`'s host mapping). While it is up the driver must
+  NOT create `machine.SPI` on those pins, so `start()` tries C first and only
+  creates the Python SPI when C declines.
+- The cutover is SELF-VALIDATING: the first C sweep is checked against
+  `_pair_ok` and needs C_SWEEP_MIN_VALID (8/16) sane sensors. A wrong SPI mode
+  or pin mapping reads garbage everywhere and falls back to Python with the bus
+  released - 16 dead knobs would otherwise look like a driver bug.
+- `verify_sweeps` is disabled on the C path (it re-reads through the Python
+  bus); the per-scan pair check in `_scan_all` still runs.
+- `_scan_one` (solo pot) routes through the same call with its two addresses,
+  which is why the C takes an address list rather than a fixed sweep.
+- The C fixes the clock at 1MHz (the MCP3002's spec limit at 2.5V) and takes
+  the settles as arguments, so `mux_settle_us` / `spi_baudrate` from
+  daughterboard.json still apply.
+
+Python sweep remains as the fallback (`"c_sweep": false` in the daughterboard
+entry forces it), and it is what runs on non-CYNTHIA builds, where the stubs
+return -1.
+
+Also seen in that report: P09 rejected 1368 pairs with raw0=307 / raw1=520 -
+the wipers are ~130 deg apart, so that pot is mispaired or has a failing wiper.
+That is hardware, not thresholds.
