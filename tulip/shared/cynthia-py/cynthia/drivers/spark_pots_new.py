@@ -169,6 +169,17 @@ ADC_SETTLE_US = 20
 # the sweep in C (32 SPI transactions at hardware speed ~3.5ms) rather than
 # stealing from the UI. Runtime-tunable via rt.set_pot_scan_rate().
 SCAN_PERIOD_MS = 33
+
+# Auto-pacing. A fixed period cannot be right for every build: the sweep is
+# whatever MicroPython + the SPI path cost on THIS board, and that has varied by
+# an order of magnitude (a PM-enabled build made it look like 3.5s). So the
+# driver times its own sweep and paces at AUTO_PACE_FACTOR x that: half the
+# thread, whatever the absolute number is. That is the fastest the pots can go
+# without starving the UI draw they share a thread with. set_scan_period() still
+# overrides it explicitly (and disables auto).
+AUTO_PACE_FACTOR = 2.0
+MIN_SCAN_PERIOD_MS = 8
+MAX_SCAN_PERIOD_MS = 50
 # Brightness ceiling for the per-pot LEDs, 0..1 of full white.
 #
 # One SK6812 at 5V full white draws ~60mA (three dies) or ~20mA on its W die, so
@@ -382,6 +393,9 @@ class Driver:
         # meter while it is not being switched.
         self._scan_period_ms = SCAN_PERIOD_MS
         self._scan_saved_ms = SCAN_PERIOD_MS
+        # Measured cost of one scan, and whether the period follows it.
+        self._sweep_ms = SCAN_PERIOD_MS / AUTO_PACE_FACTOR
+        self._auto_pace = bool(cfg_entry.get("auto_pace", True))
         # None = visit every address; an index = only poll that pot.
         self._single_pot = None
         # NeoPixels (optional, §10.2) — only if configured.
@@ -602,10 +616,12 @@ class Driver:
             dt = self._scan_period_ms
         self._dt_ms = dt
         self._last_scan_ms = now
+        t_start = time.ticks_us()
         if self._single_pot is None:
             self._scan_all()
         else:
             self._scan_one(self._single_pot)
+        self._sweep_ms = time.ticks_diff(time.ticks_us(), t_start) / 1000.0
         if self._leds and self._led_mode != "manual":
             self._update_leds()
 
@@ -867,6 +883,12 @@ class Driver:
         period = self._scan_period_ms
         if period is None:
             return
+        if self._auto_pace:
+            period = int(self._sweep_ms * AUTO_PACE_FACTOR)
+            if period < MIN_SCAN_PERIOD_MS:
+                period = MIN_SCAN_PERIOD_MS
+            elif period > MAX_SCAN_PERIOD_MS:
+                period = MAX_SCAN_PERIOD_MS
         last = self._last_scan_ms
         if last is not None and _ticks_diff(now_ms, last) < period:
             return
@@ -1333,10 +1355,22 @@ class Driver:
                 ms = 1
             self._scan_period_ms = ms
             self._scan_saved_ms = ms
+            self._auto_pace = False
         return self._scan_period_ms
 
     def scan_period(self):
+        """Configured period, or None when stopped (see set_scan_period)."""
         return self._scan_period_ms
+
+    def sweep_ms(self):
+        """Measured cost of the last scan, ms. Auto-pacing is 2x this."""
+        return self._sweep_ms
+
+    def auto_pace(self, on=None):
+        """Read or set whether the scan period follows the measured sweep."""
+        if on is not None:
+            self._auto_pace = bool(on)
+        return self._auto_pace
 
     def scan_enabled(self):
         return self._scan_period_ms is not None

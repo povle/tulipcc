@@ -659,3 +659,28 @@ Harness: a 15 deg wiper error across the crossover now tracks monotonically with
 (255.1 deg) where the hysteresis keeps the right one (269.9 deg). If a wrong-way
 step survives this, `rt.pot_debug(0)` prints used0/used1, pair errors, glitches
 and the chosen source per pot - that says which branch fired.
+
+## "The updates feel soooo slow": pacing was set from a number that is not stable
+
+The scan period was a fixed 33ms, chosen from a ~12ms sweep measurement. Two
+things are wrong with that:
+
+1. The 12ms figure (and the ~17us-per-MicroPython-operation behind it) came from
+   a build with CONFIG_PM_ENABLE=y, where the board's own notes record ticks
+   being ~1000x off ("a raw pot sweep 'takes' 3.5s instead of ~15ms"). PM is off
+   now, so the real sweep cost is unknown until it is measured on the panel.
+2. Even if it were right, a fixed period fights the poll loop: the sweep and the
+   UI draw share one thread (~12ms + ~15ms), so a 33ms period means the scan
+   fires on every *other* poll - an effective ~54ms, i.e. ~18Hz.
+
+So the driver now TIMES its own scan and paces at 2x that, clamped to 8..50ms
+(AUTO_PACE_FACTOR / MIN_SCAN_PERIOD_MS / MAX_SCAN_PERIOD_MS). Half the thread is
+the pots, whatever the absolute cost is, and the refresh rate follows the board
+instead of a stale measurement. set_scan_period() still overrides it explicitly
+and turns auto off.
+
+`rt.debug()` now prints `scan: N.NN ms measured, period N ms (auto 2x)` - that
+number is what to quote when the knobs feel slow, because it decides everything
+else. If it comes out near 3ms the pots are running at the 8ms floor (125Hz); if
+it is still ~12ms, the sweep needs to move to C (32 SPI transactions at hardware
+speed ~3.5ms), not a shorter period.
