@@ -555,8 +555,17 @@ class Driver:
             except Exception as e:
                 self._leds = None
                 print("cynthia: pot-board LEDs unavailable:", e)
-        if self._leds is not None and self.cfg.get("boot_animation", True):
-            self._boot_animation()
+        if self._leds is not None:
+            # Clear the strip FIRST. An SK6812 latches whatever its shift
+            # registers held at power-on, and shows it until something writes -
+            # which is the flash of random colours before the boot sweep. One
+            # black frame as soon as the object exists gets rid of it.
+            off = (0, 0, 0, 0) if self._led_bpp >= 4 else (0, 0, 0)
+            for i in range(len(self._leds)):
+                self._leds[i] = off
+            self._leds.write()
+            if self.cfg.get("boot_animation", True):
+                self._boot_animation()
 
     def stop(self):
         # Release the SPI host too: machine.SPI(id) cannot be created twice, so
