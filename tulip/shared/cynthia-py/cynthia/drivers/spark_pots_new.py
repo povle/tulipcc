@@ -416,6 +416,13 @@ class Driver:
         self._idle = [0] * NUM_POTS
         # +1/-1: the direction of the last emitted delta, for the reverse guard.
         self._last_dir = [0] * NUM_POTS
+        # Conservation accounting: degrees of knob travel seen vs degrees turned
+        # into parameter movement, plus how often a sample was thrown away as a
+        # resync. If travel >> emitted the knob is losing movement, and the ratio
+        # says how much; if resyncs climb, that is where it went.
+        self._travel_deg = [0.0] * NUM_POTS
+        self._emit_deg = [0.0] * NUM_POTS
+        self._resyncs = [0] * NUM_POTS
         # Per-pot "hot until" ticks (see HOT_MS) and the hot-poll pacing state.
         self._hot_until = [0] * NUM_POTS
         self._hot_ms = 0
@@ -1001,6 +1008,7 @@ class Driver:
         if resync:
             # Position jumped while the sensor was bad: take the new angle
             # as the reference but do NOT turn it into parameter movement.
+            self._resyncs[i] += 1
             self._anchor[i] = ang
             return
 
@@ -1013,6 +1021,7 @@ class Driver:
             d -= 360.0
         elif d < -180.0:
             d += 360.0
+        self._travel_deg[i] += d if d > 0.0 else -d
         # Remember the sub-deadband rotation: the LED shows it so the strip
         # tracks the hand continuously, while the PARAMETER keeps its 7 degree
         # hysteresis (that hysteresis is what stops noise accumulating).
@@ -1032,6 +1041,7 @@ class Driver:
             if self._reverse_parity is not None and (i & 1) == self._reverse_parity:
                 turns = -turns
             self._delta[i] += turns
+            self._emit_deg[i] += turns * 360.0 if turns > 0.0 else -turns * 360.0
             self._has_delta = True
             self._last_dir[i] = 1 if d > 0 else -1
             self._hot_until[i] = time.ticks_ms() + HOT_MS
@@ -1577,6 +1587,23 @@ class Driver:
         if self._scan_period_ms is None:
             return None
         return "c" if self._c_sweep is not None else "python"
+
+    def travel_report(self, min_deg=20.0):
+        """Per-pot 'knob travel vs emitted movement' lines.
+
+        Conservation check: emitted should track travel 1:1. A ratio well under
+        100% means movement was dropped, and the resync count says whether a
+        thrown-away sample is where it went.
+        """
+        out = []
+        for i in range(NUM_POTS):
+            t = self._travel_deg[i]
+            if t < min_deg:
+                continue
+            e = self._emit_deg[i]
+            out.append("P%02d travel %.0f deg, emitted %.0f (%.0f%%), resyncs %d"
+                       % (i + 1, t, e, 100.0 * e / t if t else 0.0, self._resyncs[i]))
+        return out
 
     def hot_pots(self):
         """Pot indices currently being polled at the fast cadence."""
